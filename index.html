@@ -207,7 +207,7 @@ let paused = false;
 let trailsOn = true;
 let daysPerSec = 1;                   // user-controlled
 let simSeconds = 0;
-let focusIndex = 3;                   // Earth by default
+let focusTarget = null;               // unified focus target (bodies + Moon); set to Earth once built
 
 const canvas = document.getElementById('c');
 const renderer = new THREE.WebGLRenderer({ canvas, antialias:true });
@@ -749,6 +749,51 @@ const earthState = {
   spinQuat: new THREE.Quaternion(),
 };
 
+// ============================================================================
+// The Moon — real SIZE ratio (0.273× Earth) + real orbital PERIOD (27.32 d) +
+// inclination (5.14°), but a COMPRESSED orbital distance. The real Moon orbits
+// at ~60 Earth-radii; with Earth's radius exaggerated that real distance would
+// bury the Moon inside the exaggerated Earth, so we use a viewable multiple of
+// Earth's current visual radius instead. Lit by the Sun point light → phases.
+// ============================================================================
+const moonTex = texLoader.load(TEX_BASE + 'moon_1024.jpg');
+moonTex.colorSpace = THREE.SRGBColorSpace;
+const moonMesh = new THREE.Mesh(
+  new THREE.SphereGeometry(1, 48, 32),
+  new THREE.MeshStandardMaterial({ map: moonTex, roughness: 1.0, metalness: 0.0 })
+);
+scene.add(moonMesh);
+
+const MOON_INCL = 5.145 * Math.PI / 180;
+// Faint orbit ring: unit circle in the XZ plane, pre-tilted by the inclination;
+// repositioned/scaled onto Earth each frame.
+const moonRing = (() => {
+  const seg = 160, pos = new Float32Array((seg + 1) * 3);
+  for (let i = 0; i <= seg; i++){
+    const a = i / seg * Math.PI * 2;
+    pos[i*3] = Math.cos(a); pos[i*3+1] = 0; pos[i*3+2] = Math.sin(a);
+  }
+  const g = new THREE.BufferGeometry();
+  g.setAttribute('position', new THREE.BufferAttribute(pos, 3));
+  const m = new THREE.LineBasicMaterial({ color: 0x556677, transparent: true, opacity: 0.30, depthWrite: false });
+  const loop = new THREE.Line(g, m);
+  loop.rotation.x = MOON_INCL;
+  loop.frustumCulled = false;
+  scene.add(loop);
+  return loop;
+})();
+
+const moonState = {
+  mesh: moonMesh,
+  ring: moonRing,
+  radiusRatio: 1.7374e6 / BODIES[earthIndex].R,   // Moon R / Earth R ≈ 0.2727
+  period: 27.321661 * DAY,
+  incl:   MOON_INCL,
+  orbitEarthRadii: 18,        // visual orbit radius in Earth-radii (real ≈ 60)
+  xAxis: new THREE.Vector3(1, 0, 0),
+  _offset: new THREE.Vector3(),
+};
+
 // Solar flares — each flare is a small group of 3D arched tubes (magnetic
 // loops) that physically rise from two footpoints on the surface, peak above
 // the surface, and come back down. With additive blending they read as
@@ -925,13 +970,27 @@ function fmtVolume(R){
   return V.toExponential(2)+' m³';
 }
 
-bodies.forEach((b, i) => {
+// Focusable targets = every physics body + the Moon (which lives outside the
+// `bodies` array). Each target carries what the camera and HUD need.
+const focusTargets = bodies.map((b, i) => ({
+  name: b.name, color: b.color, mesh: meshes[i], body: b, isMoon: false,
+  label: (i === 0 ? '★' : (b.a / AU).toFixed(2) + ' AU') + ' · ' + fmtMass(b.m),
+}));
+focusTargets.push({
+  name: 'Moon', color: 0xc8c8c8, mesh: moonMesh, isMoon: true,
+  mass: 7.342e22, R: 1.7374e6, refBody: bodies[earthIndex],   // heliocentric proxy
+  label: '0.273 R⊕ · ' + fmtMass(7.342e22),
+});
+focusTarget = focusTargets[earthIndex];                      // default Earth
+focusTargets.forEach(t => { t.mesh.userData.focusTarget = t; });  // for raycasting
+
+focusTargets.forEach((t) => {
   const row = document.createElement('div');
   row.className = 'pl';
-  row.innerHTML = `<span class="sw" style="background:#${b.color.toString(16).padStart(6,'0')}"></span>
-                   <span class="nm">${b.name}</span>
-                   <span class="d">${i===0?'★':((b.a/AU).toFixed(2)+' AU')} · ${fmtMass(b.m)}</span>`;
-  row.onclick = () => { focusIndex = i; };
+  row.innerHTML = `<span class="sw" style="background:#${t.color.toString(16).padStart(6,'0')}"></span>
+                   <span class="nm">${t.name}</span>
+                   <span class="d">${t.label}</span>`;
+  row.onclick = () => { focusTarget = t; };
   plist.appendChild(row);
 });
 
@@ -1003,9 +1062,10 @@ canvas.addEventListener('pointerdown', (e) => {
   mouse.x = (e.clientX / window.innerWidth)*2 - 1;
   mouse.y = -(e.clientY / window.innerHeight)*2 + 1;
   ray.setFromCamera(mouse, camera);
-  const hits = ray.intersectObjects(meshes, false);
+  const hits = ray.intersectObjects([...meshes, moonMesh], false);
   if (hits.length){
-    focusIndex = hits[0].object.userData.index;
+    const t = hits[0].object.userData.focusTarget;
+    if (t) focusTarget = t;
   }
 });
 
@@ -1090,6 +1150,22 @@ function loop(now){
     earthState.clouds.rotation.y = (simSeconds / DAY) * Math.PI * 2 * 0.10;
   }
 
+  // Moon: orbit Earth (compressed distance), real period + inclination,
+  // tidally locked (near side always faces Earth). Lit by the Sun point light.
+  {
+    const ms = moonState;
+    const em = meshes[earthState.index];
+    const earthVisR = em.scale.x;
+    const dist = ms.orbitEarthRadii * earthVisR;
+    const ang  = (simSeconds / ms.period) * Math.PI * 2;
+    ms._offset.set(Math.cos(ang) * dist, 0, Math.sin(ang) * dist).applyAxisAngle(ms.xAxis, ms.incl);
+    ms.mesh.position.copy(em.position).add(ms._offset);
+    ms.mesh.scale.setScalar(ms.radiusRatio * earthVisR);
+    ms.mesh.lookAt(em.position);                 // tidal lock
+    ms.ring.position.copy(em.position);
+    ms.ring.scale.setScalar(dist);
+  }
+
   // Thin limb halo only — real space has no visible aura around the Sun.
   // Just a hint of chromospheric glow at 1.25× the disk radius.
   const sunR_world = (scaleMode === 'real')
@@ -1171,22 +1247,25 @@ function loop(now){
     }
   }
 
-  // Camera focus follow (offset preserved relative to body)
-  const f = meshes[focusIndex].position;
-  controls.target.lerp(f, 0.15);
+  // Camera focus follow (offset preserved relative to target)
+  controls.target.lerp(focusTarget.mesh.position, 0.15);
 
-  // HUD
-  const fb = bodies[focusIndex];
-  const r = fb.pos.length();
-  const v = fb.vel.length();
-  elFocus.textContent = fb.name;
+  // HUD — Moon uses Earth's heliocentric distance/speed as a proxy (it travels
+  // with Earth around the Sun) but its own real mass/radius.
+  const ft = focusTarget;
+  const src  = ft.isMoon ? ft.refBody : ft.body;
+  const r    = src.pos.length();
+  const v    = src.vel.length();
+  const mass = ft.isMoon ? ft.mass : ft.body.m;
+  const R    = ft.isMoon ? ft.R    : ft.body.R;
+  elFocus.textContent = ft.name;
   elR.textContent = (r/AU).toFixed(3) + ' AU  (' + fmtKm(r) + ')';
   elV.textContent = (v/1000).toFixed(2) + ' km/s';
   elT.textContent = (simSeconds/DAY).toFixed(1) + ' d  (' + (simSeconds/YEAR).toFixed(3) + ' yr)';
   elTS.textContent = daysPerSec.toFixed(daysPerSec<1?3:(daysPerSec<10?2:0)) + ' d / s';
-  document.getElementById('mass').textContent  = fb.m.toExponential(3) + ' kg  (' + fmtMass(fb.m) + ')';
-  document.getElementById('radius').textContent = fmtRadius(fb.R);
-  document.getElementById('volume').textContent = fmtVolume(fb.R);
+  document.getElementById('mass').textContent  = mass.toExponential(3) + ' kg  (' + fmtMass(mass) + ')';
+  document.getElementById('radius').textContent = fmtRadius(R);
+  document.getElementById('volume').textContent = fmtVolume(R);
 
   // Drive Sun shader animation (time in seconds — slow drift on the surface).
   sunUniforms.time.value = now * 0.001;

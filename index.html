@@ -955,6 +955,62 @@ const saturnState = {
   spinPeriod: (10 + 33/60) * 3600,        // ~10h 33m, in seconds
 };
 
+// ============================================================================
+// The remaining planets — Mercury, Venus, Mars, Jupiter, Uranus, Neptune. Real
+// photographic maps are loaded below; a shared sun-lit shader gives every planet
+// a proper day/night terminator and keeps the dim outer planets visible.
+// ============================================================================
+
+// Shared sun-lit shader (texture + day/night terminator), one instance per planet.
+function makeSunlitMaterial(map, sunDir){
+  return new THREE.ShaderMaterial({
+    uniforms: { map: { value: map }, sunDir: { value: sunDir } },
+    vertexShader: /* glsl */`
+      varying vec2 vUv; varying vec3 vNormalW;
+      void main(){
+        vUv = uv; vNormalW = normalize(mat3(modelMatrix) * normal);
+        gl_Position = projectionMatrix * modelViewMatrix * vec4(position, 1.0);
+      }`,
+    fragmentShader: /* glsl */`
+      uniform sampler2D map; uniform vec3 sunDir;
+      varying vec2 vUv; varying vec3 vNormalW;
+      void main(){
+        vec3 base = texture2D(map, vUv).rgb;
+        float ndl = dot(normalize(vNormalW), normalize(sunDir));
+        gl_FragColor = vec4(base * (0.06 + 0.94 * clamp(ndl, 0.0, 1.0)), 1.0);
+      }`,
+  });
+}
+
+// Build + register each planet using real photographic maps (PlanetPixelEmporium
+// / Solar System Scope set, served CORS-enabled via jsDelivr).
+// [name, texture file, axial tilt°, rotation period hours (− = retrograde)]
+const PLANET_TEX = 'https://cdn.jsdelivr.net/gh/jeromeetienne/threex.planets/images/';
+const extraPlanets = [];
+[
+  ['Mercury', 'mercurymap.jpg', 0.03,   1407.6],
+  ['Venus',   'venusmap.jpg',   177.4, -5832.5],
+  ['Mars',    'marsmap1k.jpg',  25.19,    24.6],
+  ['Jupiter', 'jupitermap.jpg', 3.13,      9.93],
+  ['Uranus',  'uranusmap.jpg',  97.77,   -17.24],
+  ['Neptune', 'neptunemap.jpg', 28.32,    16.11],
+].forEach(([nm, file, tiltDeg, perHr]) => {
+  const idx  = BODIES.findIndex(b => b.name === nm);
+  const mesh = meshes[idx];
+  const sunDir = new THREE.Vector3(1, 0, 0);
+  const tex = texLoader.load(PLANET_TEX + file);
+  tex.colorSpace = THREE.SRGBColorSpace;
+  mesh.material.dispose();
+  mesh.material = makeSunlitMaterial(tex, sunDir);
+  extraPlanets.push({
+    mesh, sunDir,
+    tiltQuat: new THREE.Quaternion().setFromAxisAngle(new THREE.Vector3(0, 0, 1), tiltDeg * Math.PI / 180),
+    spinAxis: new THREE.Vector3(0, 1, 0),
+    spinQuat: new THREE.Quaternion(),
+    spinPeriod: perHr * 3600,
+  });
+});
+
 // Solar flares — each flare is a small group of 3D arched tubes (magnetic
 // loops) that physically rise from two footpoints on the surface, peak above
 // the surface, and come back down. With additive blending they read as
@@ -1338,6 +1394,15 @@ function loop(now){
     ss.sunDir.copy(meshes[0].position).sub(sm.position).normalize();  // shared with ring
     ss.ringUniforms.planetCenter.value.copy(sm.position);
     ss.ringUniforms.planetRadius.value = sm.scale.x;     // equatorial radius (world)
+  }
+
+  // Mercury / Venus / Mars / Jupiter / Uranus / Neptune: axial tilt + spin and
+  // per-planet Sun direction for the shared sun-lit shader.
+  for (const p of extraPlanets){
+    const spin = (simSeconds / p.spinPeriod) * Math.PI * 2;
+    p.spinQuat.setFromAxisAngle(p.spinAxis, spin);
+    p.mesh.quaternion.copy(p.tiltQuat).multiply(p.spinQuat);
+    p.sunDir.copy(meshes[0].position).sub(p.mesh.position).normalize();
   }
 
   // Thin limb halo only — real space has no visible aura around the Sun.

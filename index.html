@@ -514,15 +514,8 @@ bodies.forEach((b, i) => {
   scene.add(mesh);
   meshes.push(mesh);
 
-  // Saturn ring — geometry in unit-sphere coordinates (1.4–2.2 planet radii,
-  // matching the real B/A ring extent). Scales with the parent automatically.
-  if (b.name === 'Saturn'){
-    const ringGeo = new THREE.RingGeometry(1.4, 2.2, 64);
-    const ringMat = new THREE.MeshBasicMaterial({ color:0xc8b48a, side:THREE.DoubleSide, transparent:true, opacity:0.55 });
-    const ring = new THREE.Mesh(ringGeo, ringMat);
-    ring.rotation.x = Math.PI/2.4;
-    mesh.add(ring);
-  }
+  // (Saturn's oblate body, banded surface, and ring system are built in a
+  // dedicated block after the loop.)
 
   // Sun glow — kept independent of mesh scale so the halo stays visible at any
   // size exaggeration. Positioned manually each frame.
@@ -792,6 +785,174 @@ const moonState = {
   orbitEarthRadii: 18,        // visual orbit radius in Earth-radii (real ≈ 60)
   xAxis: new THREE.Vector3(1, 0, 0),
   _offset: new THREE.Vector3(),
+};
+
+// ============================================================================
+// Realistic Saturn — procedural banded surface, oblate body, 26.7° axial tilt
+// + spin, and a shader ring system with the real C / B / Cassini / A structure,
+// fine ringlets, and the planet's shadow cast across the rings.
+// ============================================================================
+// Procedural latitude-banded texture (cream / tan / gold zones + turbulence).
+function makeSaturnTexture(){
+  const w = 1024, h = 512;
+  const cnv = document.createElement('canvas'); cnv.width = w; cnv.height = h;
+  const ctx = cnv.getContext('2d');
+  const n = makeNoise3D(101);
+  const img = ctx.createImageData(w, h);
+  const d = img.data;
+  // Palette stops (dark belt → tan → bright cream zone), plus polar gray.
+  const dark = [168, 138, 92], tan = [212, 188, 138], cream = [240, 226, 184];
+  const pole = [150, 150, 140];
+  for (let y = 0; y < h; y++){
+    const lat = (y / h) * 2 - 1;                       // -1 (S) .. +1 (N)
+    for (let x = 0; x < w; x++){
+      const theta = (x / w) * Math.PI * 2;
+      const cx = Math.cos(theta), sx = Math.sin(theta);
+      // Wavy band edges: warp latitude with low-freq noise.
+      const warp = (n(cx * 1.4, sx * 1.4, lat * 3.0) - 0.5) * 0.05;
+      const L = lat + warp;
+      // Multi-frequency belts/zones.
+      let bv = Math.sin(L * Math.PI * 8.0) * 0.5
+             + Math.sin(L * Math.PI * 19.0) * 0.28
+             + Math.sin(L * Math.PI * 3.3) * 0.22;
+      bv = bv * 0.5 + 0.5;                               // 0..1
+      bv += (n(cx * 4.0, sx * 4.0, L * 11.0) - 0.5) * 0.18;   // fine turbulence
+      bv = Math.min(1, Math.max(0, bv));
+      // Two-segment palette: dark→tan→cream.
+      let r, g, b;
+      if (bv < 0.5){ const t = bv / 0.5; r = dark[0]+(tan[0]-dark[0])*t; g = dark[1]+(tan[1]-dark[1])*t; b = dark[2]+(tan[2]-dark[2])*t; }
+      else         { const t = (bv-0.5)/0.5; r = tan[0]+(cream[0]-tan[0])*t; g = tan[1]+(cream[1]-tan[1])*t; b = tan[2]+(cream[2]-tan[2])*t; }
+      // Darken/gray toward the poles.
+      const polar = Math.pow(Math.abs(L), 3.2);
+      r += (pole[0]-r)*polar*0.7; g += (pole[1]-g)*polar*0.7; b += (pole[2]-b)*polar*0.7;
+      const i = (y*w+x)*4; d[i]=r; d[i+1]=g; d[i+2]=b; d[i+3]=255;
+    }
+  }
+  ctx.putImageData(img, 0, 0);
+  const tex = new THREE.CanvasTexture(cnv);
+  tex.colorSpace = THREE.SRGBColorSpace;
+  return tex;
+}
+
+const saturnIndex = BODIES.findIndex(b => b.name === 'Saturn');
+const saturnMesh  = meshes[saturnIndex];
+
+// Oblate body: polar radius ≈ 0.90 × equatorial. Baked into the geometry so the
+// uniform mesh scale keeps it oblate while the (child) ring stays circular.
+saturnMesh.geometry.dispose();
+const satGeo = new THREE.SphereGeometry(1, 96, 64);
+satGeo.scale(1, 0.902, 1);
+saturnMesh.geometry = satGeo;
+saturnMesh.material.dispose();
+const saturnSunDir = new THREE.Vector3(1, 0, 0);     // world-space, Saturn → Sun (shared)
+saturnMesh.material = new THREE.ShaderMaterial({
+  uniforms: { map: { value: makeSaturnTexture() }, sunDir: { value: saturnSunDir } },
+  vertexShader: /* glsl */`
+    varying vec2 vUv;
+    varying vec3 vNormalW;
+    void main(){
+      vUv = uv;
+      vNormalW = normalize(mat3(modelMatrix) * normal);
+      gl_Position = projectionMatrix * modelViewMatrix * vec4(position, 1.0);
+    }
+  `,
+  fragmentShader: /* glsl */`
+    uniform sampler2D map;
+    uniform vec3 sunDir;
+    varying vec2 vUv;
+    varying vec3 vNormalW;
+    void main(){
+      vec3 base = texture2D(map, vUv).rgb;
+      float ndl = dot(normalize(vNormalW), normalize(sunDir));
+      float lit = 0.06 + 0.94 * clamp(ndl, 0.0, 1.0);    // proper terminator, bands stay visible
+      gl_FragColor = vec4(base * lit, 1.0);
+    }
+  `,
+});
+
+// Ring system — RingGeometry in Saturn-radii units (scales with the planet).
+const ringUniforms = {
+  sunDir:       { value: saturnSunDir },               // shared with the body shader
+  planetCenter: { value: new THREE.Vector3() },
+  planetRadius: { value: 1.0 },
+};
+const saturnRing = new THREE.Mesh(
+  new THREE.RingGeometry(1.24, 2.27, 256, 8),
+  new THREE.ShaderMaterial({
+    uniforms: ringUniforms,
+    transparent: true,
+    side: THREE.DoubleSide,
+    depthWrite: false,
+    vertexShader: /* glsl */`
+      varying float vR;          // ring radius in Saturn-radii
+      varying vec3  vWorldPos;
+      void main(){
+        vR = length(position.xy);
+        vec4 wp = modelMatrix * vec4(position, 1.0);
+        vWorldPos = wp.xyz;
+        gl_Position = projectionMatrix * viewMatrix * wp;
+      }
+    `,
+    fragmentShader: /* glsl */`
+      uniform vec3 sunDir, planetCenter;
+      uniform float planetRadius;
+      varying float vR;
+      varying vec3 vWorldPos;
+
+      // Opacity profile of the rings vs radius (Saturn radii).
+      float ringAlpha(float r){
+        float c = 0.42 * smoothstep(1.24, 1.30, r) * (1.0 - smoothstep(1.50, 1.525, r)); // C ring
+        float b = 0.95 * smoothstep(1.525, 1.57, r) * (1.0 - smoothstep(1.92, 1.95, r)); // B ring
+        float cass = 0.10 * smoothstep(1.95, 1.97, r) * (1.0 - smoothstep(2.01, 2.025, r)); // Cassini
+        float a = 0.68 * smoothstep(2.025, 2.06, r) * (1.0 - smoothstep(2.25, 2.27, r));  // A ring
+        float al = c + b + cass + a;
+        // Encke gap near the outer A ring.
+        al *= 1.0 - 0.85 * exp(-pow((r - 2.214) / 0.006, 2.0));
+        // Fine ringlets — thousands of concentric striations.
+        al *= 0.82 + 0.18 * sin(r * 240.0 + sin(r * 47.0) * 2.5);
+        return clamp(al, 0.0, 1.0);
+      }
+      vec3 ringColor(float r){
+        vec3 cC = vec3(0.52, 0.47, 0.40);   // C ring, dark grayish
+        vec3 cB = vec3(0.88, 0.80, 0.63);   // B ring, bright tan
+        vec3 cA = vec3(0.74, 0.68, 0.56);   // A ring, medium tan
+        vec3 col = mix(cC, cB, smoothstep(1.50, 1.57, r));
+        col = mix(col, cA, smoothstep(1.97, 2.05, r));
+        return col;
+      }
+
+      void main(){
+        float al = ringAlpha(vR);
+        if (al < 0.01) discard;
+        vec3 col = ringColor(vR);
+
+        // Planet shadow: is the ray from this point toward the Sun blocked by Saturn?
+        vec3 L  = normalize(sunDir);
+        vec3 oc = planetCenter - vWorldPos;
+        float tca = dot(oc, L);
+        float shadow = 1.0;
+        if (tca > 0.0){
+          float d = sqrt(max(dot(oc, oc) - tca * tca, 0.0));
+          shadow = mix(0.10, 1.0, smoothstep(planetRadius * 0.98, planetRadius * 1.10, d));
+        }
+        gl_FragColor = vec4(col * shadow, al);
+      }
+    `,
+  })
+);
+saturnRing.rotation.x = Math.PI / 2;     // RingGeometry (XY) → equatorial (XZ) plane
+saturnRing.renderOrder = 2;
+saturnMesh.add(saturnRing);
+
+const saturnState = {
+  mesh: saturnMesh,
+  ring: saturnRing,
+  ringUniforms,
+  sunDir: saturnSunDir,                    // shared body+ring sun direction
+  tiltQuat: new THREE.Quaternion().setFromAxisAngle(new THREE.Vector3(0, 0, 1), 26.73 * Math.PI / 180),
+  spinAxis: new THREE.Vector3(0, 1, 0),
+  spinQuat: new THREE.Quaternion(),
+  spinPeriod: (10 + 33/60) * 3600,        // ~10h 33m, in seconds
 };
 
 // Solar flares — each flare is a small group of 3D arched tubes (magnetic
@@ -1164,6 +1325,19 @@ function loop(now){
     ms.mesh.lookAt(em.position);                 // tidal lock
     ms.ring.position.copy(em.position);
     ms.ring.scale.setScalar(dist);
+  }
+
+  // Saturn: 26.7° axial tilt + spin, and feed the ring shader the Sun direction,
+  // planet centre and (equatorial) radius for the cast-shadow computation.
+  {
+    const ss = saturnState;
+    const sm = ss.mesh;
+    const spin = (simSeconds / ss.spinPeriod) * Math.PI * 2;
+    ss.spinQuat.setFromAxisAngle(ss.spinAxis, spin);
+    sm.quaternion.copy(ss.tiltQuat).multiply(ss.spinQuat);
+    ss.sunDir.copy(meshes[0].position).sub(sm.position).normalize();  // shared with ring
+    ss.ringUniforms.planetCenter.value.copy(sm.position);
+    ss.ringUniforms.planetRadius.value = sm.scale.x;     // equatorial radius (world)
   }
 
   // Thin limb halo only — real space has no visible aura around the Sun.

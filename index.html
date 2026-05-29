@@ -240,7 +240,11 @@ scene.background = new THREE.Color(0x000005);
 // Far plane reaches galactic distance (~6e10 AU). The tiny near plane keeps the
 // solar system's depth precision intact (hyperbolic depth concentrates precision
 // near the camera), and the galaxy renders as additive, depth-write-off points.
-const camera = new THREE.PerspectiveCamera(55, window.innerWidth/window.innerHeight, 0.001, 6e10);
+// FOV kept fairly narrow (35°): a wide flat-plane perspective projection stretches
+// an off-axis sphere into an ellipse (the projected grazing-ray cone hits the flat
+// image plane obliquely). A narrow FOV approaches the angular/orthographic case, so
+// bodies stay round wherever they sit in frame — matching what an eye actually sees.
+const camera = new THREE.PerspectiveCamera(35, window.innerWidth/window.innerHeight, 0.001, 6e10);
 camera.position.set(0, 8, 18);
 
 const controls = new OrbitControls(camera, canvas);
@@ -774,6 +778,48 @@ const MOON_DEFS = [
   { planet:'Neptune', name:'Triton',   rr:0.055, orbit:9,   per:-5.877,  inc:157, R:1.3534e6, m:2.14e22,  color:0xd8c4b4, tex:MOON_TEX+'triton.png' },
   { planet:'Pluto',   name:'Charon',   rr:0.51,  orbit:7,   per:6.387,   inc:0.0, R:6.06e5,   m:1.586e21, color:0x9a938b, tex:MOON_TEX+'charon.png' },
 ];
+// Ultra-thin atmosphere shell — same impact-parameter halo as Earth's but with a
+// far steeper density falloff and a faint, desaturated tint, so a body like the
+// Moon carries only a barely-there sliver of haze hugging the limb. Centre/radius/
+// camera uniforms are fed per-frame; sunDir is shared by reference with the body.
+function makeMoonAtmosphere(sunDirRef){
+  const mat = new THREE.ShaderMaterial({
+    uniforms: {
+      sunDir:     { value: sunDirRef },
+      camPos:     { value: new THREE.Vector3() },
+      bodyCenter: { value: new THREE.Vector3() },
+      bodyRadius: { value: 1.0 },
+    },
+    transparent: true, side: THREE.BackSide, depthWrite: false, blending: THREE.AdditiveBlending,
+    vertexShader: /* glsl */`
+      varying vec3 vPosW;
+      void main(){ vec4 wp = modelMatrix * vec4(position, 1.0); vPosW = wp.xyz;
+                   gl_Position = projectionMatrix * viewMatrix * wp; }
+    `,
+    fragmentShader: /* glsl */`
+      uniform vec3 sunDir, camPos, bodyCenter; uniform float bodyRadius;
+      varying vec3 vPosW;
+      void main(){
+        vec3 rayDir  = normalize(vPosW - camPos);
+        vec3 toC     = bodyCenter - camPos;
+        float tCA    = max(dot(toC, rayDir), 0.0);
+        vec3  closest = camPos + rayDir * tCA;
+        float b      = length(closest - bodyCenter);        // impact parameter
+        float alt    = (b - bodyRadius) / bodyRadius;        // altitude in radii
+        float density = exp(-max(alt, 0.0) * 55.0);          // very steep → ultra-thin
+        density *= smoothstep(-0.004, 0.010, alt);           // hidden inside the limb
+        density *= 1.0 - smoothstep(0.03, 0.06, alt);        // fade before the shell edge
+        vec3 Nlimb = normalize(closest - bodyCenter);
+        float lit  = smoothstep(-0.30, 0.25, dot(Nlimb, normalize(sunDir)));
+        vec3 col = mix(vec3(0.30, 0.35, 0.48), vec3(0.66, 0.72, 0.82), density);
+        gl_FragColor = vec4(col, density * lit * 0.45);      // faint
+      }
+    `,
+  });
+  const mesh = new THREE.Mesh(new THREE.SphereGeometry(1.08, 48, 32), mat);
+  return { mesh, mat };
+}
+
 const moons = MOON_DEFS.map(def => {
   const parentIdx = BODIES.findIndex(b => b.name === def.planet);
   const sunDir = new THREE.Vector3(1, 0, 0);
@@ -790,14 +836,21 @@ const moons = MOON_DEFS.map(def => {
   }
   const mesh = new THREE.Mesh(new THREE.SphereGeometry(1, 48, 32), mat);
   scene.add(mesh);
+  // Earth's Moon gets a wisp-thin atmosphere shell (child → inherits pos/scale).
+  let atmoMat = null;
+  if (def.name === 'Moon'){
+    const atmo = makeMoonAtmosphere(sunDir);
+    mesh.add(atmo.mesh);
+    atmoMat = atmo.mat;
+  }
   // Faint orbit ring (unit circle in XZ, tilted by inclination; placed each frame).
   const incl = def.inc * Math.PI / 180;
   const seg = 160, rp = new Float32Array((seg + 1) * 3);
   for (let i = 0; i <= seg; i++){ const a = i / seg * Math.PI * 2; rp[i*3] = Math.cos(a); rp[i*3+1] = 0; rp[i*3+2] = Math.sin(a); }
   const rg = new THREE.BufferGeometry(); rg.setAttribute('position', new THREE.BufferAttribute(rp, 3));
-  const ring = new THREE.Line(rg, new THREE.LineBasicMaterial({ color: 0x556677, transparent: true, opacity: 0.20, depthWrite: false }));
+  const ring = new THREE.Line(rg, new THREE.LineBasicMaterial({ color: 0x3a4654, transparent: true, opacity: 0.12, depthWrite: false }));
   ring.rotation.x = incl; ring.frustumCulled = false; scene.add(ring);
-  return { def, parentIdx, mesh, ring, sunDir, incl, _offset: new THREE.Vector3() };
+  return { def, parentIdx, mesh, ring, sunDir, incl, atmoMat, _offset: new THREE.Vector3() };
 });
 
 // ============================================================================
@@ -1081,7 +1134,7 @@ for (let i = 1; i < BODIES.length; i++){
   geo.setAttribute('position', new THREE.BufferAttribute(pos, 3));
   const mat = new THREE.LineBasicMaterial({
     color: new THREE.Color(b.color).multiplyScalar(0.05),   // very faint
-    transparent: false, depthTest: false, depthWrite: false,
+    transparent: true, opacity: 0.4, depthTest: false, depthWrite: false,
   });
   const line = new THREE.Line(geo, mat);
   line.renderOrder = -1;
@@ -1599,6 +1652,11 @@ function loop(now){
     mn.mesh.scale.setScalar(mn.def.rr * pr);
     mn.mesh.lookAt(pm.position);                             // tidal lock
     mn.sunDir.copy(meshes[0].position).sub(mn.mesh.position).normalize();
+    if (mn.atmoMat){
+      mn.atmoMat.uniforms.camPos.value.copy(camera.position);
+      mn.atmoMat.uniforms.bodyCenter.value.copy(mn.mesh.position);
+      mn.atmoMat.uniforms.bodyRadius.value = mn.mesh.scale.x;
+    }
     mn.ring.position.copy(pm.position);
     mn.ring.scale.setScalar(dist);
   }

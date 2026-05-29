@@ -31,7 +31,13 @@
     position:fixed; top:10px; right:10px; padding:10px 12px; background:rgba(8,12,22,0.78);
     border:1px solid #1b2436; border-radius:8px; font-size:12px; min-width:260px; max-height:80vh; overflow:auto;
   }
-  #planets h1 { font-size:13px; margin:0 0 6px 0; color:#9fd0ff; }
+  #planets h1 { font-size:13px; margin:0 0 6px 0; color:#9fd0ff; display:flex; align-items:center; justify-content:space-between; }
+  #planets h1 #plToggle { background:#1a2438; color:#cfd6e4; border:1px solid #2a3a5c; border-radius:4px;
+    font-size:11px; line-height:1; padding:2px 8px; cursor:pointer; }
+  #planets h1 #plToggle:hover { background:#243352; }
+  #planets.collapsed { min-width:0; }
+  #planets.collapsed #plist { display:none; }
+  #planets.collapsed h1 { margin:0; }
   .pl { display:flex; align-items:center; gap:8px; padding:3px 0; cursor:pointer; border-radius:4px; padding-left:4px; }
   .pl:hover { background:rgba(255,255,255,0.04); }
   .sw { width:10px; height:10px; border-radius:50%; flex:none; }
@@ -49,7 +55,7 @@
 <div id="hud">
   <h1>Beyond — Solar System</h1>
   <div class="row"><span class="k">Sim time</span><span class="v" id="t">0 d</span></div>
-  <div class="row"><span class="k">Time scale</span><span class="v" id="ts">1 d / s</span></div>
+  <div class="row"><span class="k">Orbit scale</span><span class="v" id="ts">1 d / s</span></div>
   <div class="row"><span class="k">Step</span><span class="v" id="dt">— s</span></div>
   <div class="row"><span class="k">Focus</span><span class="v" id="focus">Sun</span></div>
   <div class="row"><span class="k">Distance from Sun</span><span class="v" id="r">0 AU</span></div>
@@ -60,17 +66,19 @@
 </div>
 
 <div id="controls">
-  <div><button id="pause">Pause</button><button id="reset">Reset</button><button id="trails">Orbits: on</button></div>
+  <div><button id="pause">Pause</button><button id="reset">Reset</button><button id="trails">Orbits: on</button><button id="follow">Follow: off</button></div>
   <div style="margin-top:6px"><button id="modeBtn">Mode: Real ratios</button><button id="scaleMode">1×</button></div>
-  <label>Time scale (days per real second): <span id="tsv">1</span></label>
+  <label>Orbit time scale (days per real second): <span id="tsv">1</span></label>
   <input type="range" id="tsRange" min="-2" max="4" step="0.01" value="0" />
+  <label>Rotation time scale (days per real second): <span id="rsv">1</span></label>
+  <input type="range" id="rotRange" min="-2" max="4" step="0.01" value="0" />
   <label>Body size exaggeration <span id="sxLabel">(real mode only)</span>: <span id="sxv">300</span>×</label>
   <input type="range" id="sxRange" min="0" max="3.5" step="0.01" value="2.477" />
   <div id="legend">Drag to rotate · scroll to zoom · click a body to focus</div>
 </div>
 
 <div id="planets">
-  <h1>Bodies</h1>
+  <h1>Bodies <button id="plToggle" title="Collapse / expand">▾</button></h1>
   <div id="plist"></div>
 </div>
 
@@ -209,9 +217,17 @@ function schematicRadius(b, i){
 let bodies = initState();
 let paused = false;
 let orbitsOn = true;
-let daysPerSec = 1;                   // user-controlled
-let simSeconds = 0;
+let daysPerSec = 1;                   // user-controlled orbital time scale
+let spinDaysPerSec = 1;               // user-controlled axial-rotation time scale (independent)
+let simSeconds = 0;                   // accumulated orbital time
+let spinSeconds = 0;                  // accumulated rotation time
 let focusTarget = null;               // unified focus target (bodies + Moon); set to Earth once built
+let followCam = false;                 // when on, the camera tracks the focused body's motion (offset preserved)
+let followTarget = null;               // the target the follow-delta is measured against
+const followPrev = new THREE.Vector3();// focused body's position on the previous frame
+const followPrevCenter = new THREE.Vector3(); // orbit centre's position on the previous frame
+let followPrevDir = null;              // unit radial direction (centre→body) on the previous frame
+const _fv0 = new THREE.Vector3(), _fv1 = new THREE.Vector3(), _fv2 = new THREE.Vector3(), _fq = new THREE.Quaternion();
 
 const canvas = document.getElementById('c');
 const renderer = new THREE.WebGLRenderer({ canvas, antialias:true });
@@ -221,12 +237,16 @@ renderer.setSize(window.innerWidth, window.innerHeight);
 const scene = new THREE.Scene();
 scene.background = new THREE.Color(0x000005);
 
-const camera = new THREE.PerspectiveCamera(55, window.innerWidth/window.innerHeight, 0.001, 100000);
+// Far plane reaches galactic distance (~6e10 AU). The tiny near plane keeps the
+// solar system's depth precision intact (hyperbolic depth concentrates precision
+// near the camera), and the galaxy renders as additive, depth-write-off points.
+const camera = new THREE.PerspectiveCamera(55, window.innerWidth/window.innerHeight, 0.001, 6e10);
 camera.position.set(0, 8, 18);
 
 const controls = new OrbitControls(camera, canvas);
 controls.enableDamping = true;
 controls.dampingFactor = 0.08;
+controls.maxDistance = 5.5e10;        // allow zooming out to the galaxy
 
 
 // Star field background
@@ -1229,6 +1249,8 @@ const elR = document.getElementById('r');
 const elV = document.getElementById('v');
 const elTSV = document.getElementById('tsv');
 const tsRange = document.getElementById('tsRange');
+const elRSV = document.getElementById('rsv');
+const rotRange = document.getElementById('rotRange');
 const btnPause = document.getElementById('pause');
 const btnReset = document.getElementById('reset');
 const btnTrails = document.getElementById('trails');
@@ -1248,19 +1270,108 @@ function fmtVolume(R){
   return V.toExponential(2)+' m³';
 }
 
+// ============================================================================
+// The Milky Way — a stylized spiral galaxy placed far out in the same scene,
+// with the Sun sitting IN its disk (~half-radius from the centre). It's ~10⁹×
+// the solar system, so from here it reads as a faint band of stars across the
+// sky; fly out via its ⊕ button to see the spiral. The galactic core (the dense
+// bulge / Sgr A* region) is a second focusable body at the centre.
+// ============================================================================
+const LY = 63241;                                         // AU (= scene units) per light-year
+const GAL_R = 50000 * LY;                                 // ~3.16e9 — real 50,000 ly disk radius
+const GAL_CENTER = new THREE.Vector3(26000 * LY, 0, 0);   // Sun (origin) sits in-plane ~26,000 ly out
+const GAL_VIEW = new THREE.Vector3(0.22, 1.0, 0.14).normalize();   // face-on-ish framing direction
+
+const milkyWay = (() => {
+  // (a) Real top-down Milky Way (ESO/NASA/JPL-Caltech/R.Hurt) on a disk. Additive
+  //     blending makes the image's black background drop out, leaving only the
+  //     glowing galaxy — so it looks like the actual artist conception.
+  const tex = texLoader.load('https://upload.wikimedia.org/wikipedia/commons/thumb/4/4f/Artist%E2%80%99s_impression_of_the_Milky_Way.jpg/1920px-Artist%E2%80%99s_impression_of_the_Milky_Way.jpg');
+  tex.colorSpace = THREE.SRGBColorSpace;
+  const sz = GAL_R * 2.4;
+  const planeMat = new THREE.MeshBasicMaterial({ map: tex, transparent: true, blending: THREE.AdditiveBlending,
+                                  depthWrite: false, side: THREE.DoubleSide, opacity: 1 });
+  const plane = new THREE.Mesh(new THREE.PlaneGeometry(sz, sz), planeMat);
+  plane.position.copy(GAL_CENTER);
+  plane.rotation.x = -Math.PI/2;                 // lie in the galactic (XZ) plane
+  plane.frustumCulled = false;
+  scene.add(plane);
+
+  // (b) Faint 3D star layer — gives the disk volume and, since the flat image is
+  //     edge-on from the Sun, provides the Milky-Way band of stars across the sky.
+  //     Colours are pale cream→warm-gold (NOT blue): a dense field of additive
+  //     blue points reads as a blue haze, which is unrealistic for the band.
+  const N = 80000, hR = GAL_R*0.34, bulgeR = GAL_R*0.18;
+  const pos = new Float32Array(N*3), col = new Float32Array(N*3);
+  const rnd = Math.random, randn = () => (rnd()+rnd()+rnd()-1.5);
+  const cWarm = new THREE.Color(0xffdca0), cDisk = new THREE.Color(0xfff1de), tmp = new THREE.Color();
+  const diskR = () => { let r; do { r = -hR*Math.log(1 - rnd()*0.998); } while (r > GAL_R); return r; };
+  for (let i = 0; i < N; i++){
+    let x, y, z, r, br;
+    if (i < N*0.2){
+      r = Math.pow(rnd(),2)*bulgeR;
+      const u = rnd()*2-1, th = rnd()*Math.PI*2, s = Math.sqrt(1-u*u);
+      x = r*s*Math.cos(th)*1.6; z = r*s*Math.sin(th)*0.9; y = r*u*0.5;
+      tmp.copy(cWarm); br = 0.3 + rnd()*0.4;
+    } else {
+      r = diskR();
+      const ang = rnd()*Math.PI*2;
+      x = r*Math.cos(ang); z = r*Math.sin(ang);
+      y = randn()*GAL_R*0.02*Math.exp(-r/(hR*1.4));
+      tmp.copy(cDisk).lerp(cWarm, Math.max(0,1-r/bulgeR)*0.7); br = 0.10 + rnd()*0.13;
+    }
+    pos[i*3]=x; pos[i*3+1]=y; pos[i*3+2]=z;
+    col[i*3]=tmp.r*br; col[i*3+1]=tmp.g*br; col[i*3+2]=tmp.b*br;
+  }
+  const g = new THREE.BufferGeometry();
+  g.setAttribute('position', new THREE.BufferAttribute(pos,3));
+  g.setAttribute('color', new THREE.BufferAttribute(col,3));
+  const starMat = new THREE.PointsMaterial({
+    size: 1.2, sizeAttenuation: false, vertexColors: true, map: DOT_TEX,
+    transparent: true, opacity: 0.5, blending: THREE.AdditiveBlending, depthWrite: false,
+  });
+  const pts = new THREE.Points(g, starMat);
+  pts.position.copy(GAL_CENTER);
+  pts.frustumCulled = false;
+  scene.add(pts);
+  plane.userData.starMat = starMat;
+  plane.userData.planeMat = planeMat;
+  plane.userData.stars = pts;
+  return plane;
+})();
+
+// Invisible proxies carrying position + framing radius for the focus system.
+const galaxyProxy = new THREE.Object3D(); galaxyProxy.position.copy(GAL_CENTER); galaxyProxy.scale.setScalar(GAL_R);
+const coreProxy   = new THREE.Object3D(); coreProxy.position.copy(GAL_CENTER);   coreProxy.scale.setScalar(GAL_R*0.30);  // frames the bulge
+scene.add(galaxyProxy); scene.add(coreProxy);
+
 // Focusable targets = every physics body + the Moon (which lives outside the
 // `bodies` array). Each target carries what the camera and HUD need.
 const focusTargets = bodies.map((b, i) => ({
   name: b.name, color: b.color, mesh: meshes[i], body: b, isMoon: false,
+  // Orbit centre for the follow-cam: planets orbit the Sun (mesh 0); the Sun has none.
+  centerMesh: i === 0 ? null : meshes[0],
   label: (i === 0 ? '★' : (b.a / AU).toFixed(2) + ' AU') + ' · ' + fmtMass(b.m),
 }));
 for (const mn of moons){
   focusTargets.push({
     name: mn.def.name, color: mn.def.color ?? 0xc8c8c8, mesh: mn.mesh, isMoon: true,
     mass: mn.def.m, R: mn.def.R, refBody: bodies[mn.parentIdx],   // heliocentric proxy
+    centerMesh: meshes[mn.parentIdx],            // moons orbit their parent planet
     label: mn.def.planet + ' moon · ' + fmtMass(mn.def.m),
   });
 }
+// Galactic-scale targets (custom HUD; framed face-on via viewDir).
+focusTargets.push({
+  name: 'Milky Way', color: 0x9fc0ff, mesh: galaxyProxy, custom: true, viewDir: GAL_VIEW,
+  label: 'galaxy · ~100k ly',
+  info: { r: '—', v: '~220 km/s galactic orbit', mass: '~1.5×10¹² M☉', radius: '~50,000 ly', vol: '~10¹³ ly³' },
+});
+focusTargets.push({
+  name: 'Galactic Core (Sgr A*)', color: 0xffe9b8, mesh: coreProxy, custom: true, viewDir: GAL_VIEW,
+  label: 'Sgr A* · core',
+  info: { r: '~26,000 ly from Sun', v: '—', mass: '~4.3×10⁶ M☉ (Sgr A*)', radius: 'event horizon ~1.3×10¹⁰ m', vol: '—' },
+});
 focusTarget = focusTargets[earthIndex];                      // default Earth
 focusTargets.forEach(t => { t.mesh.userData.focusTarget = t; });  // for raycasting
 
@@ -1274,14 +1385,20 @@ function frameBody(t){
   const H = window.innerHeight;
   const S = Math.min(window.innerWidth, window.innerHeight);
   const d = 3 * R * H / (S * Math.tan(camera.fov * Math.PI / 360));   // fov/2 in radians
-  // Place the camera on the SUNLIT side so we see a lit surface, not the night
-  // side (which would render as a near-black ball). Add a small elevation +
-  // sideways offset so there's a visible terminator and a 3D look.
-  const toSun = new THREE.Vector3().subVectors(meshes[0].position, P).normalize();
-  if (toSun.lengthSq() < 1e-12) toSun.set(0, 0, 1);
-  const up = Math.abs(toSun.y) > 0.9 ? new THREE.Vector3(1, 0, 0) : new THREE.Vector3(0, 1, 0);
-  const side = new THREE.Vector3().crossVectors(toSun, up).normalize();
-  const dir = toSun.clone().multiplyScalar(0.86).addScaledVector(up, 0.34).addScaledVector(side, 0.18).normalize();
+  let dir;
+  if (t.viewDir){
+    // Fixed framing direction (e.g. galaxy viewed face-on).
+    dir = t.viewDir.clone().normalize();
+  } else {
+    // Place the camera on the SUNLIT side so we see a lit surface, not the night
+    // side (which would render as a near-black ball). Add a small elevation +
+    // sideways offset so there's a visible terminator and a 3D look.
+    const toSun = new THREE.Vector3().subVectors(meshes[0].position, P).normalize();
+    if (toSun.lengthSq() < 1e-12) toSun.set(0, 0, 1);
+    const up = Math.abs(toSun.y) > 0.9 ? new THREE.Vector3(1, 0, 0) : new THREE.Vector3(0, 1, 0);
+    const side = new THREE.Vector3().crossVectors(toSun, up).normalize();
+    dir = toSun.clone().multiplyScalar(0.86).addScaledVector(up, 0.34).addScaledVector(side, 0.18).normalize();
+  }
   controls.target.copy(P);
   camera.position.copy(P).addScaledVector(dir, d);
   // Ensure the body stays inside the near plane (lower near only, never raise).
@@ -1306,17 +1423,41 @@ focusTargets.forEach((t) => {
   plist.appendChild(row);
 });
 
+const fmtTS = (v) => v >= 1 ? v.toFixed(v < 10 ? 2 : 0) : v.toFixed(3);
 tsRange.addEventListener('input', () => {
   // log scale: -2..4  -> 0.01 .. 10000 days/sec
   daysPerSec = Math.pow(10, parseFloat(tsRange.value));
-  elTSV.textContent = daysPerSec >= 1
-    ? daysPerSec.toFixed(daysPerSec < 10 ? 2 : 0)
-    : daysPerSec.toFixed(3);
+  elTSV.textContent = fmtTS(daysPerSec);
+});
+rotRange.addEventListener('input', () => {
+  spinDaysPerSec = Math.pow(10, parseFloat(rotRange.value));
+  elRSV.textContent = fmtTS(spinDaysPerSec);
 });
 btnPause.onclick = () => { paused = !paused; btnPause.textContent = paused ? 'Resume' : 'Pause'; };
+const btnFollow = document.getElementById('follow');
+btnFollow.onclick = () => {
+  followCam = !followCam;
+  btnFollow.textContent = 'Follow: ' + (followCam ? 'on' : 'off');
+  // Re-arm the delta tracker so the first follow frame doesn't jump.
+  followTarget = focusTarget;
+  followPrevDir = null;
+  if (focusTarget){
+    followPrev.copy(focusTarget.mesh.position);
+    if (focusTarget.centerMesh) followPrevCenter.copy(focusTarget.centerMesh.position);
+  }
+  // Turning follow off: restore world-up so free orbiting isn't left rolled.
+  if (!followCam){ camera.up.set(0, 1, 0); controls.update(); }
+};
+const planetsPanel = document.getElementById('planets');
+const btnPlToggle = document.getElementById('plToggle');
+btnPlToggle.onclick = () => {
+  const collapsed = planetsPanel.classList.toggle('collapsed');
+  btnPlToggle.textContent = collapsed ? '▸' : '▾';
+};
 btnReset.onclick = () => {
   bodies = initState();
   simSeconds = 0;
+  spinSeconds = 0;
 };
 btnTrails.onclick = () => {
   orbitsOn = !orbitsOn;
@@ -1409,6 +1550,7 @@ function loop(now){
     const dt = simDeltaSec / substeps;
     for (let s=0; s<substeps; s++) step(bodies, dt);
     simSeconds += simDeltaSec;
+    spinSeconds += dtReal * spinDaysPerSec * DAY;   // independent axial-rotation clock
     elDT.textContent = dt.toExponential(2) + ' s';
   }
 
@@ -1418,13 +1560,20 @@ function loop(now){
     meshes[i].position.set(b.pos.x * SCENE_SCALE, b.pos.y * SCENE_SCALE, b.pos.z * SCENE_SCALE);
   }
 
+  // Keep each planet's drawn orbit anchored to the Sun, which is its focus. The
+  // N-body Sun drifts off the origin over time (the system has non-zero net
+  // momentum and the Sun wobbles from Jupiter's pull) and carries the planets
+  // with it, so a static origin-centred ellipse slowly falls off the body.
+  // Translating the lines to the Sun re-aligns each ellipse's focus with its body.
+  for (const line of orbitLines) line.position.copy(meshes[0].position);
+
   // Slow Sun rotation — the real Sun's equator rotates ~25 days/turn.
-  meshes[0].rotation.y = (simSeconds / (25 * DAY)) * Math.PI * 2;
+  meshes[0].rotation.y = (spinSeconds / (25 * DAY)) * Math.PI * 2;
 
   // Earth: axial tilt (23.44°) + one spin per day, plus lighting uniforms.
   {
     const em = meshes[earthState.index];
-    const spin = (simSeconds / DAY) * Math.PI * 2;
+    const spin = (spinSeconds / DAY) * Math.PI * 2;
     earthState.spinQuat.setFromAxisAngle(earthState.spinAxis, spin);
     em.quaternion.copy(earthState.tiltQuat).multiply(earthState.spinQuat);
     // Sun direction (earth → sun) and camera position, mutated in place so the
@@ -1435,7 +1584,7 @@ function loop(now){
     earthState.atmoMat.uniforms.earthCenter.value.copy(em.position);
     earthState.atmoMat.uniforms.earthRadius.value = em.scale.x;
     // Clouds drift slowly relative to the surface.
-    earthState.clouds.rotation.y = (simSeconds / DAY) * Math.PI * 2 * 0.10;
+    earthState.clouds.rotation.y = (spinSeconds / DAY) * Math.PI * 2 * 0.10;
   }
 
   // Moons: orbit their planet (compressed distance), tidally locked, sun-lit so
@@ -1459,7 +1608,7 @@ function loop(now){
   {
     const ss = saturnState;
     const sm = ss.mesh;
-    const spin = (simSeconds / ss.spinPeriod) * Math.PI * 2;
+    const spin = (spinSeconds / ss.spinPeriod) * Math.PI * 2;
     ss.spinQuat.setFromAxisAngle(ss.spinAxis, spin);
     sm.quaternion.copy(ss.tiltQuat).multiply(ss.spinQuat);
     ss.sunDir.copy(meshes[0].position).sub(sm.position).normalize();  // shared with ring
@@ -1470,7 +1619,7 @@ function loop(now){
   // Mercury / Venus / Mars / Jupiter / Uranus / Neptune: axial tilt + spin and
   // per-planet Sun direction for the shared sun-lit shader.
   for (const p of extraPlanets){
-    const spin = (simSeconds / p.spinPeriod) * Math.PI * 2;
+    const spin = (spinSeconds / p.spinPeriod) * Math.PI * 2;
     p.spinQuat.setFromAxisAngle(p.spinAxis, spin);
     p.mesh.quaternion.copy(p.tiltQuat).multiply(p.spinQuat);
     p.sunDir.copy(meshes[0].position).sub(p.mesh.position).normalize();
@@ -1560,25 +1709,104 @@ function loop(now){
     }
   }
 
-  // Camera focus follow (offset preserved relative to target)
-  controls.target.lerp(focusTarget.mesh.position, 0.15);
+  // Camera focus / follow.
+  const focusPos = focusTarget.mesh.position;
+  if (followCam && followTarget === focusTarget){
+    // Lock the viewer into the orbit's co-rotating frame, anchored at the
+    // trajectory CENTRE (Sun for planets, parent planet for moons). Each frame we
+    // measure how far the radial vector centre→body swept and revolve the WHOLE
+    // camera frame (position about the centre + up vector) by that same rotation.
+    // Using the radial vector — not the velocity tangent — makes it correct for
+    // eccentric orbits, where the tangent turns non-uniformly but the radial
+    // vector tracks the true revolution. The viewer therefore keeps a fixed
+    // position relative to {centre, body, body+¼-rev}. A mouse drag is captured
+    // (we re-read the camera each frame) and then carried along, so it re-locks.
+    const cm = focusTarget.centerMesh;
+    if (cm){
+      const C = cm.position;
+      const curRad = _fv0.copy(focusPos).sub(C);
+      const rLen = curRad.length();
+      if (rLen > 1e-9){
+        curRad.multiplyScalar(1 / rLen);
+        if (followPrevDir){
+          _fq.setFromUnitVectors(followPrevDir, curRad);
+          // Translate with the (moving) centre, then revolve about it.
+          _fv1.copy(camera.position).sub(followPrevCenter).applyQuaternion(_fq);
+          camera.position.copy(C).add(_fv1);
+          camera.up.applyQuaternion(_fq).normalize();
+        } else {
+          followPrevDir = new THREE.Vector3();
+        }
+        followPrevDir.copy(curRad);
+      }
+      followPrevCenter.copy(C);
+    } else {
+      // No orbit centre (Sun / galaxy): just rigid-translate with the body.
+      if (followPrevDir) camera.position.add(_fv1.copy(focusPos).sub(followPrev));
+      else followPrevDir = new THREE.Vector3();
+    }
+    controls.target.copy(focusPos);
+  } else {
+    // Not following: ease the target onto the body but leave the camera put.
+    controls.target.lerp(focusPos, 0.15);
+    followPrevDir = null;            // re-arm so a freshly-followed body doesn't jump
+  }
+  followTarget = focusTarget;
+  followPrev.copy(focusPos);
+
+  // Adaptive zoom: scale the dolly step to how many "object radii" away we are,
+  // so it's fine near the focused body and fast out in the (vast, mostly empty)
+  // space between scales — essential now that the galaxy is ~10⁹× the planets.
+  {
+    const refR = focusTarget.mesh.scale.x || 1;
+    const ratio = camera.position.distanceTo(controls.target) / refR;
+    controls.zoomSpeed = Math.min(12, Math.max(0.4, Math.log10(ratio + 1) * 1.7));
+  }
+
+  // Galaxy density fade: from inside the solar system the local star density is
+  // low, so the Milky Way should read as a faint band and space stays dark. Only
+  // as the camera pulls out toward galactic distances does the full glowing disk
+  // resolve. Ramp on log10(distance from the Sun): ~1e6 AU (faint) → ~1e9 AU (full).
+  {
+    const camD = camera.position.length();
+    const f = THREE.MathUtils.smoothstep(Math.log10(camD + 1), 6, 9);
+    // Below the ramp the galaxy contributes nothing meaningful, so stop drawing
+    // it: the huge edge-on image plane otherwise flickers (black ↔ light blue) as
+    // the camera's tiny vertical jitter flips the coplanar quad in and out of view.
+    const showGal = f > 0.002;
+    milkyWay.visible = showGal;
+    milkyWay.userData.stars.visible = showGal;
+    if (showGal){
+      milkyWay.userData.starMat.opacity  = 0.03 + 0.47 * f;
+      milkyWay.userData.planeMat.opacity = 0.06 + 0.94 * f;
+    }
+  }
 
   // HUD — Moon uses Earth's heliocentric distance/speed as a proxy (it travels
-  // with Earth around the Sun) but its own real mass/radius.
+  // with Earth around the Sun) but its own real mass/radius. Galactic targets
+  // ('custom') show pre-formatted facts instead of live sim values.
   const ft = focusTarget;
-  const src  = ft.isMoon ? ft.refBody : ft.body;
-  const r    = src.pos.length();
-  const v    = src.vel.length();
-  const mass = ft.isMoon ? ft.mass : ft.body.m;
-  const R    = ft.isMoon ? ft.R    : ft.body.R;
   elFocus.textContent = ft.name;
-  elR.textContent = (r/AU).toFixed(3) + ' AU  (' + fmtKm(r) + ')';
-  elV.textContent = (v/1000).toFixed(2) + ' km/s';
-  elT.textContent = (simSeconds/DAY).toFixed(1) + ' d  (' + (simSeconds/YEAR).toFixed(3) + ' yr)';
   elTS.textContent = daysPerSec.toFixed(daysPerSec<1?3:(daysPerSec<10?2:0)) + ' d / s';
-  document.getElementById('mass').textContent  = mass.toExponential(3) + ' kg  (' + fmtMass(mass) + ')';
-  document.getElementById('radius').textContent = fmtRadius(R);
-  document.getElementById('volume').textContent = fmtVolume(R);
+  elT.textContent = (simSeconds/DAY).toFixed(1) + ' d  (' + (simSeconds/YEAR).toFixed(3) + ' yr)';
+  if (ft.custom){
+    elR.textContent = ft.info.r;
+    elV.textContent = ft.info.v;
+    document.getElementById('mass').textContent  = ft.info.mass;
+    document.getElementById('radius').textContent = ft.info.radius;
+    document.getElementById('volume').textContent = ft.info.vol;
+  } else {
+    const src  = ft.isMoon ? ft.refBody : ft.body;
+    const r    = src.pos.length();
+    const v    = src.vel.length();
+    const mass = ft.isMoon ? ft.mass : ft.body.m;
+    const R    = ft.isMoon ? ft.R    : ft.body.R;
+    elR.textContent = (r/AU).toFixed(3) + ' AU  (' + fmtKm(r) + ')';
+    elV.textContent = (v/1000).toFixed(2) + ' km/s';
+    document.getElementById('mass').textContent  = mass.toExponential(3) + ' kg  (' + fmtMass(mass) + ')';
+    document.getElementById('radius').textContent = fmtRadius(R);
+    document.getElementById('volume').textContent = fmtVolume(R);
+  }
 
   // Drive Sun shader animation (time in seconds — slow drift on the surface).
   sunUniforms.time.value = now * 0.001;

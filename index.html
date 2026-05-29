@@ -74,6 +74,8 @@
   <input type="range" id="rotRange" min="-2" max="4" step="0.01" value="0" />
   <label>Body size exaggeration <span id="sxLabel">(real mode only)</span>: <span id="sxv">300</span>×</label>
   <input type="range" id="sxRange" min="0" max="3.5" step="0.01" value="2.477" />
+  <label>Spacecraft traffic: <span id="trafficV">rare</span></label>
+  <input type="range" id="trafficRange" min="0" max="5" step="1" value="1" />
   <div id="legend">Drag to rotate · scroll to zoom · click a body to focus</div>
 </div>
 
@@ -1134,10 +1136,11 @@ for (let i = 1; i < BODIES.length; i++){
   geo.setAttribute('position', new THREE.BufferAttribute(pos, 3));
   const mat = new THREE.LineBasicMaterial({
     color: new THREE.Color(b.color).multiplyScalar(0.05),   // very faint
-    transparent: true, opacity: 0.4, depthTest: false, depthWrite: false,
+    // depthTest ON so an opaque body occludes the orbit portion behind it
+    // (no X-ray); depthWrite OFF so the thin lines don't z-fight one another.
+    transparent: true, opacity: 0.4, depthWrite: false,
   });
   const line = new THREE.Line(geo, mat);
-  line.renderOrder = -1;
   line.frustumCulled = false;
   scene.add(line);
   orbitLines.push(line);
@@ -1580,6 +1583,257 @@ window.addEventListener('resize', () => {
 });
 
 // ============================================================================
+// Spacecraft traffic — alien visitors arriving from deep space and human craft
+// launched from Earth. Each spawn picks a random procedural model (movie-inspired
+// archetypes) with varied size, hull tint and neon/engine glow, then runs a
+// shared lifecycle: arrive/launch → orbit Earth 1–5× → land on Earth or the Moon
+// (dwell, then depart) or fly off. Motion is real-time, anchored to Earth.
+// ============================================================================
+const earthMoon = moons.find(m => m.def.name === 'Moon');
+const craft = [];
+const MAX_CRAFT = 6;
+const TRAFFIC_INTERVALS = [Infinity, 50, 26, 12, 6, 2.5];   // mean seconds between spawns
+const TRAFFIC_LABELS    = ['off','rare','occasional','frequent','very frequent','swarm'];
+let trafficIdx = 1;
+let trafficTimer = 6;
+
+const _YUP = new THREE.Vector3(0,1,0);
+const _sv = Array.from({length:10}, () => new THREE.Vector3());
+const cRand  = (a,b) => a + Math.random()*(b-a);
+const cPick  = arr => arr[(Math.random()*arr.length)|0];
+function cUnit(out){ const u=Math.random()*2-1, th=Math.random()*Math.PI*2, s=Math.sqrt(1-u*u);
+  return (out||new THREE.Vector3()).set(s*Math.cos(th), s*Math.sin(th), u); }
+
+const HULL_ALIEN = [0x6b7480,0x2a2f3a,0x7a6a4a,0xc8ccd4,0x3b4a66,0x4a4f57];
+const GLOW_ALIEN = [0x66ffd0,0x7ad1ff,0xff6ad5,0xffc24a,0x9cff5e,0xff5a5a,0xeaf2ff];
+const HULL_HUMAN = [0xf0f0f2,0xd8dde2,0xb8c0c8,0xe8e8ea];
+const matHull = c => new THREE.MeshStandardMaterial({ color:c, metalness:0.9,  roughness:0.35 });
+const matPaint= c => new THREE.MeshStandardMaterial({ color:c, metalness:0.25, roughness:0.6  });
+const matGlow = c => new THREE.MeshBasicMaterial({ color:c });
+const matEmit = (b,c,i) => new THREE.MeshStandardMaterial({ color:b, emissive:new THREE.Color(c), emissiveIntensity:i, metalness:0.4, roughness:0.4 });
+const matAdd  = (c,o) => new THREE.MeshBasicMaterial({ color:c, transparent:true, opacity:o, blending:THREE.AdditiveBlending, depthWrite:false, side:THREE.DoubleSide });
+const darker  = (c,f) => new THREE.Color(c).multiplyScalar(f);
+
+function addBeam(g, glow, r){
+  const beam = new THREE.Mesh(new THREE.ConeGeometry(r, r*2.4, 24, 1, true), matAdd(glow,0.20));
+  beam.position.y = -r*1.2; beam.visible = false; g.add(beam); return beam;
+}
+function addFlame(g, z0, len, col){
+  const f = new THREE.Mesh(new THREE.ConeGeometry(0.14, len, 16, 1, true), matAdd(col||0xff9a3a, 0.8));
+  f.geometry.rotateX(Math.PI/2);            // apex → +Z (trailing), base at the engine
+  f.position.z = z0 + len/2; f.visible = false; g.add(f); return f;
+}
+
+// ---- Alien archetypes (built with dome/"up" along +Y) ----
+function buildSaucer(){
+  const hull = cPick(HULL_ALIEN), glow = cPick(GLOW_ALIEN), g = new THREE.Group();
+  const body = new THREE.Mesh(new THREE.SphereGeometry(1,30,18), matHull(hull)); body.scale.set(1,0.26,1); g.add(body);
+  const rim  = new THREE.Mesh(new THREE.TorusGeometry(0.82,0.15,14,44), matHull(darker(hull,0.55)));
+  rim.rotation.x = Math.PI/2; rim.position.y = -0.02; g.add(rim);
+  const dome = new THREE.Mesh(new THREE.SphereGeometry(0.5,24,14,0,Math.PI*2,0,Math.PI/2), matEmit(0x101820, glow, 0.9));
+  dome.position.y = 0.13; dome.scale.set(1,1.15,1); dome.material.transparent = true; dome.material.opacity = 0.9; g.add(dome);
+  const lights = new THREE.Mesh(new THREE.TorusGeometry(0.9,0.035,8,48), matGlow(glow));
+  lights.rotation.x = Math.PI/2; lights.position.y = -0.04; g.add(lights);
+  return { group:g, beam:addBeam(g,glow,0.7), flame:null, orient:'hover', baseSize:cRand(0.05,0.085), spin:cRand(0.8,2.0) };
+}
+function buildMothership(){
+  const hull = cPick(HULL_ALIEN), glow = cPick(GLOW_ALIEN), g = new THREE.Group();
+  const disc = new THREE.Mesh(new THREE.SphereGeometry(1,40,24), matHull(hull)); disc.scale.set(1,0.15,1); g.add(disc);
+  const belly= new THREE.Mesh(new THREE.SphereGeometry(0.55,28,18), matHull(darker(hull,0.6))); belly.scale.set(1,0.55,1); belly.position.y=-0.1; g.add(belly);
+  const dome = new THREE.Mesh(new THREE.SphereGeometry(0.4,24,14,0,Math.PI*2,0,Math.PI/2), matEmit(0x101820,glow,0.8)); dome.position.y=0.07; g.add(dome);
+  for (const rr of [0.95,0.62]){ const ring=new THREE.Mesh(new THREE.TorusGeometry(rr,0.02,8,60), matGlow(glow)); ring.rotation.x=Math.PI/2; g.add(ring); }
+  for (let k=0;k<48;k++){ const a=k/48*Math.PI*2; const w=new THREE.Mesh(new THREE.BoxGeometry(0.025,0.02,0.05), matGlow(glow)); w.position.set(Math.cos(a)*0.8,0.0,Math.sin(a)*0.8); g.add(w); }
+  const spire = new THREE.Mesh(new THREE.ConeGeometry(0.06,0.5,12), matHull(darker(hull,0.5))); spire.position.y=-0.32; spire.rotation.x=Math.PI; g.add(spire);
+  return { group:g, beam:addBeam(g,glow,1.1), flame:null, orient:'hover', baseSize:cRand(0.16,0.24), spin:cRand(0.15,0.5) };
+}
+function buildFighter(){
+  const hull = cPick(HULL_ALIEN), glow = cPick(GLOW_ALIEN), g = new THREE.Group();
+  const fus = new THREE.Mesh(new THREE.CapsuleGeometry(0.16,1.0,6,14), matHull(hull)); fus.rotation.x=Math.PI/2; g.add(fus);
+  for (const sgn of [-1,1]){ const w=new THREE.Mesh(new THREE.BoxGeometry(0.7,0.03,0.4), matHull(darker(hull,0.8)));
+    w.position.set(sgn*0.42,0,0.12); w.rotation.z=sgn*0.18; g.add(w); }
+  const cock = new THREE.Mesh(new THREE.SphereGeometry(0.12,16,12), matEmit(0x101820,glow,1.0)); cock.position.set(0,0.06,-0.4); cock.scale.set(1,0.7,1.4); g.add(cock);
+  const eng = new THREE.Mesh(new THREE.SphereGeometry(0.1,14,10), matGlow(glow)); eng.position.z=0.55; g.add(eng);
+  return { group:g, beam:null, flame:addFlame(g,0.6,0.7,glow), orient:'fly', baseSize:cRand(0.03,0.05), spin:0 };
+}
+function buildOrb(){
+  const glow = cPick(GLOW_ALIEN), g = new THREE.Group();
+  g.add(new THREE.Mesh(new THREE.SphereGeometry(0.5,24,18), matGlow(glow)));
+  g.add(new THREE.Mesh(new THREE.SphereGeometry(1,30,22), matAdd(glow,0.16)));
+  const ring = new THREE.Mesh(new THREE.TorusGeometry(1.05,0.03,8,44), matGlow(glow)); ring.rotation.set(cRand(0,3),cRand(0,3),0); g.add(ring);
+  return { group:g, beam:addBeam(g,glow,0.6), flame:null, orient:'hover', baseSize:cRand(0.04,0.07), spin:cRand(1.5,3.0) };
+}
+// ---- Human archetypes (built with nose along −Z, exhaust along +Z) ----
+function buildRocket(){
+  const white = cPick(HULL_HUMAN), accent = cPick([0xcc2222,0x202020,0x1133aa]), g = new THREE.Group();
+  const body = new THREE.Mesh(new THREE.CylinderGeometry(0.16,0.16,1.2,20), matPaint(white)); body.rotation.x=Math.PI/2; g.add(body);
+  const cone = new THREE.Mesh(new THREE.ConeGeometry(0.16,0.4,20), matPaint(white)); cone.rotation.x=-Math.PI/2; cone.position.z=-0.8; g.add(cone);
+  const band = new THREE.Mesh(new THREE.CylinderGeometry(0.165,0.165,0.18,20), matPaint(accent)); band.rotation.x=Math.PI/2; band.position.z=-0.25; g.add(band);
+  for (let k=0;k<4;k++){ const a=k/4*Math.PI*2; const fin=new THREE.Mesh(new THREE.BoxGeometry(0.03,0.28,0.26), matPaint(accent));
+    fin.position.set(Math.cos(a)*0.16,Math.sin(a)*0.16,0.55); g.add(fin); }
+  const bell = new THREE.Mesh(new THREE.CylinderGeometry(0.1,0.14,0.16,16), matHull(darker(0x888888,1))); bell.rotation.x=Math.PI/2; bell.position.z=0.66; g.add(bell);
+  return { group:g, beam:null, flame:addFlame(g,0.72,cRand(0.7,1.1),0xffb24a), orient:'fly', baseSize:cRand(0.04,0.07), spin:0 };
+}
+function buildShuttle(){
+  const white = cPick(HULL_HUMAN), g = new THREE.Group();
+  const fus = new THREE.Mesh(new THREE.CapsuleGeometry(0.17,0.8,6,14), matPaint(white)); fus.rotation.x=Math.PI/2; g.add(fus);
+  const nose= new THREE.Mesh(new THREE.SphereGeometry(0.17,16,12), matPaint(darker(0x303030,1))); nose.position.z=-0.5; nose.scale.set(1,1,1.4); g.add(nose);
+  for (const sgn of [-1,1]){ const w=new THREE.Mesh(new THREE.BoxGeometry(0.55,0.04,0.5), matPaint(white));
+    w.position.set(sgn*0.36,-0.04,0.25); w.rotation.z=sgn*0.05; g.add(w); }
+  const tail = new THREE.Mesh(new THREE.BoxGeometry(0.04,0.32,0.28), matPaint(white)); tail.position.set(0,0.18,0.42); g.add(tail);
+  for (let k=-1;k<=1;k++){ const e=new THREE.Mesh(new THREE.SphereGeometry(0.05,12,10), matGlow(0x99bbff)); e.position.set(k*0.07,0.0,0.5); g.add(e); }
+  return { group:g, beam:null, flame:addFlame(g,0.52,0.8,0xbcd4ff), orient:'fly', baseSize:cRand(0.05,0.08), spin:0 };
+}
+function buildCapsule(){
+  const white = cPick(HULL_HUMAN), g = new THREE.Group();
+  const cap = new THREE.Mesh(new THREE.CylinderGeometry(0.12,0.26,0.34,20), matPaint(white)); cap.rotation.x=-Math.PI/2; g.add(cap);
+  const top = new THREE.Mesh(new THREE.CylinderGeometry(0.06,0.12,0.12,16), matPaint(darker(0x555555,1))); top.rotation.x=-Math.PI/2; top.position.z=-0.22; g.add(top);
+  const sm  = new THREE.Mesh(new THREE.CylinderGeometry(0.22,0.22,0.34,20), matHull(darker(0x777777,1))); sm.rotation.x=Math.PI/2; sm.position.z=0.32; g.add(sm);
+  for (let k=0;k<3;k++){ const a=k/3*Math.PI*2; const win=new THREE.Mesh(new THREE.BoxGeometry(0.05,0.04,0.02), matGlow(0x99ccff)); win.position.set(Math.cos(a)*0.2,Math.sin(a)*0.2,-0.05); g.add(win); }
+  return { group:g, beam:null, flame:addFlame(g,0.5,0.5,0xbcd4ff), orient:'fly', baseSize:cRand(0.03,0.05), spin:0 };
+}
+const ALIEN_BUILDERS = [buildSaucer, buildMothership, buildFighter, buildOrb];
+const HUMAN_BUILDERS = [buildRocket, buildShuttle, buildCapsule];
+
+function spawnCraft(){
+  const human = Math.random() < 0.3;
+  const spec = cPick(human ? HUMAN_BUILDERS : ALIEN_BUILDERS)();
+  const g = spec.group; g.frustumCulled = false; scene.add(g);
+  const n = cUnit(), t = Math.abs(n.y) > 0.9 ? new THREE.Vector3(1,0,0) : _YUP;
+  const u = new THREE.Vector3().crossVectors(n,t).normalize();
+  const v = new THREE.Vector3().crossVectors(n,u).normalize();
+  const sh = {
+    group:g, beam:spec.beam, flame:spec.flame, orient:spec.orient, baseSize:spec.baseSize,
+    spinRate:spec.spin||0, spinPhase:Math.random()*6.283, faction: human?'human':'alien',
+    // Aliens hug Earth in a low, dramatic orbit; human craft sit a bit higher.
+    u, v, orbitR: human ? cRand(2.2,3.6) : cRand(1.35,2.1), angle:Math.random()*6.283,
+    angSpeed:cRand(0.7,1.5)*(Math.random()<0.5?1:-1), rounds:1+((Math.random()*5)|0),
+    fromOff:new THREE.Vector3(), prevPos:null, landDir:new THREE.Vector3(),
+    leaveDir:new THREE.Vector3(), leaveDist:0, landTarget:null, afterLand:'leave',
+    arriveDir:cUnit(), arriveDist:cRand(45,90), dwell:0, dur:cRand(4,7),
+  };
+  if (human){ cUnit(sh.landDir); sh.state='launching'; sh.dur=cRand(4,7); }
+  else      { sh.state='arriving'; }
+  sh.t = 0;
+  craft.push(sh);
+}
+
+function placeCraft(sh, pos, refDir, dt, mode){
+  const g = sh.group;
+  const up = _sv[9].copy(refDir.lengthSq()>1e-12 ? refDir : _YUP).normalize();
+  if (mode === 'hover'){
+    sh.spinPhase += sh.spinRate*dt; g.up.set(0,1,0);
+    g.quaternion.setFromUnitVectors(_YUP, up); g.rotateY(sh.spinPhase); g.position.copy(pos);
+  } else if (mode === 'fly'){
+    let fwd = _sv[6];
+    if (sh.prevPos && _sv[6].copy(pos).sub(sh.prevPos).lengthSq() > 1e-16) fwd.normalize(); else fwd.copy(up);
+    g.up.copy(up); g.position.copy(pos); g.lookAt(_sv[5].copy(pos).add(fwd));
+  } else { // 'stand' : nose (−Z) points along refDir (radial up)
+    let s = _sv[7].crossVectors(up, _YUP); if (s.lengthSq() < 1e-9) s.set(1,0,0);
+    g.up.copy(s.normalize()); g.position.copy(pos); g.lookAt(_sv[5].copy(pos).add(up));
+  }
+  if (!sh.prevPos) sh.prevPos = new THREE.Vector3();
+  sh.prevPos.copy(pos);
+}
+function craftFx(sh, thrust, beamOn){ if (sh.flame) sh.flame.visible = thrust; if (sh.beam) sh.beam.visible = beamOn; }
+
+function updateCraft(dt, earthPos, earthR, moonPos, moonR){
+  const TWO_PI = Math.PI*2;
+  for (let i = craft.length-1; i >= 0; i--){
+    const sh = craft[i]; sh.t += dt;
+    sh.group.scale.setScalar(sh.baseSize * earthR);
+    const orbitRad = sh.orbitR * earthR;
+    const orbitPos = ang => _sv[0].copy(earthPos).addScaledVector(sh.u, orbitRad*Math.cos(ang)).addScaledVector(sh.v, orbitRad*Math.sin(ang));
+
+    if (sh.state === 'launching'){
+      const start  = _sv[1].copy(earthPos).addScaledVector(sh.landDir, earthR);
+      const target = _sv[2].copy(orbitPos(sh.angle));
+      const p = Math.min(1, sh.t/sh.dur), e = p*p;
+      const pos = _sv[3].copy(start).lerp(target, e);
+      placeCraft(sh, pos, _sv[4].copy(pos).sub(earthPos), dt, 'fly'); craftFx(sh, true, false);
+      if (p >= 1){ sh.state='orbiting'; sh.t=0; }
+    }
+    else if (sh.state === 'arriving'){
+      const start  = _sv[1].copy(earthPos).addScaledVector(sh.arriveDir, sh.arriveDist*earthR);
+      const target = _sv[2].copy(orbitPos(sh.angle));
+      const p = Math.min(1, sh.t/sh.dur), e = p*p*(3-2*p);
+      const pos = _sv[3].copy(start).lerp(target, e);
+      placeCraft(sh, pos, _sv[4].copy(pos).sub(earthPos), dt, sh.orient); craftFx(sh, false, false);
+      if (p >= 1){ sh.state='orbiting'; sh.t=0; }
+    }
+    else if (sh.state === 'orbiting'){
+      sh.angle += sh.angSpeed*dt;
+      const pos = orbitPos(sh.angle);
+      placeCraft(sh, pos, _sv[4].copy(pos).sub(earthPos), dt, sh.orient); craftFx(sh, false, false);
+      if (Math.abs(sh.angSpeed)*sh.t >= sh.rounds*TWO_PI){
+        let land = false, onMoon = false;
+        if (sh.faction === 'human'){
+          const r = Math.random();
+          if (r < 0.45){ land=true; onMoon=false; sh.afterLand='despawn'; }
+          else if (r < 0.78 && earthMoon){ land=true; onMoon=true; sh.afterLand='leave'; }
+        } else {
+          if (Math.random() < 0.55){ land=true; onMoon = earthMoon && Math.random()<0.5; sh.afterLand='leave'; }
+        }
+        if (land){
+          sh.landTarget = onMoon ? 'moon' : 'earth'; cUnit(sh.landDir);
+          sh.dur = cRand(3,5); sh.dwell = cRand(6,16);
+          const Ct = onMoon ? moonPos : earthPos; sh.fromOff.copy(pos).sub(Ct);
+          sh.state='descending'; sh.t=0;
+        } else {
+          cUnit(sh.leaveDir); sh.leaveDist = cRand(60,110); sh.dur = cRand(5,8);
+          sh.fromOff.copy(pos).sub(earthPos); sh.state='leaving'; sh.t=0;
+        }
+      }
+    }
+    else if (sh.state === 'descending'){
+      const onMoon = sh.landTarget === 'moon';
+      const Ct = onMoon ? moonPos : earthPos, Rt = onMoon ? moonR : earthR;
+      const start = _sv[1].copy(Ct).add(sh.fromOff);
+      const surf  = _sv[2].copy(Ct).addScaledVector(sh.landDir, Rt + 0.04*earthR);
+      const p = Math.min(1, sh.t/sh.dur), e = p*p*(3-2*p);
+      const pos = _sv[3].copy(start).lerp(surf, e);
+      const mode = sh.faction === 'human' ? 'stand' : 'hover';
+      placeCraft(sh, pos, sh.landDir, dt, mode);
+      craftFx(sh, sh.faction === 'human', sh.faction === 'alien');
+      if (p >= 1){ sh.state='landed'; sh.t=0; }
+    }
+    else if (sh.state === 'landed'){
+      const onMoon = sh.landTarget === 'moon';
+      const Ct = onMoon ? moonPos : earthPos, Rt = onMoon ? moonR : earthR;
+      const pos = _sv[2].copy(Ct).addScaledVector(sh.landDir, Rt + 0.04*earthR);
+      placeCraft(sh, pos, sh.landDir, dt, sh.faction === 'human' ? 'stand' : 'hover');
+      craftFx(sh, false, sh.faction === 'alien');
+      if (sh.t >= sh.dwell){
+        if (sh.afterLand === 'despawn'){ disposeCraft(sh, i); continue; }
+        sh.leaveDir.copy(sh.landDir); sh.leaveDist = cRand(60,110); sh.dur = cRand(5,8);
+        sh.fromOff.copy(pos).sub(earthPos); sh.state='leaving'; sh.t=0;
+      }
+    }
+    else if (sh.state === 'leaving'){
+      const start  = _sv[1].copy(earthPos).add(sh.fromOff);
+      const target = _sv[2].copy(earthPos).addScaledVector(sh.leaveDir, sh.leaveDist*earthR);
+      const p = Math.min(1, sh.t/sh.dur), e = p*p;
+      const pos = _sv[3].copy(start).lerp(target, e);
+      placeCraft(sh, pos, _sv[4].copy(pos).sub(earthPos), dt, sh.orient);
+      craftFx(sh, sh.faction === 'human', false);
+      if (p >= 1){ disposeCraft(sh, i); }
+    }
+  }
+}
+function disposeCraft(sh, i){
+  scene.remove(sh.group);
+  sh.group.traverse(o => { if (o.geometry) o.geometry.dispose(); if (o.material) o.material.dispose(); });
+  craft.splice(i, 1);
+}
+
+const trafficRange = document.getElementById('trafficRange');
+const elTrafficV   = document.getElementById('trafficV');
+trafficRange.addEventListener('input', () => {
+  trafficIdx = parseInt(trafficRange.value, 10);
+  elTrafficV.textContent = TRAFFIC_LABELS[trafficIdx];
+});
+elTrafficV.textContent = TRAFFIC_LABELS[trafficIdx];
+
+// ============================================================================
 // Main loop
 // ============================================================================
 let last = performance.now();
@@ -1659,6 +1913,23 @@ function loop(now){
     }
     mn.ring.position.copy(pm.position);
     mn.ring.scale.setScalar(dist);
+  }
+
+  // Spacecraft traffic — spawn on a real-time timer and advance each craft's
+  // lifecycle. Anchored to Earth (and the Moon for landings); frozen while paused.
+  if (!paused){
+    const eM = meshes[earthState.index];
+    const earthPos = eM.position, earthR = eM.scale.x;
+    const moonPos = earthMoon ? earthMoon.mesh.position : earthPos;
+    const moonR   = earthMoon ? earthMoon.mesh.scale.x : earthR;
+    if (trafficIdx > 0){
+      trafficTimer -= dtReal;
+      if (trafficTimer <= 0){
+        if (craft.length < MAX_CRAFT) spawnCraft();
+        trafficTimer = TRAFFIC_INTERVALS[trafficIdx] * (0.5 + Math.random());
+      }
+    }
+    updateCraft(dtReal, earthPos, earthR, moonPos, moonR);
   }
 
   // Saturn: 26.7° axial tilt + spin, and feed the ring shader the Sun direction,
@@ -1819,6 +2090,22 @@ function loop(now){
     const refR = focusTarget.mesh.scale.x || 1;
     const ratio = camera.position.distanceTo(controls.target) / refR;
     controls.zoomSpeed = Math.min(12, Math.max(0.4, Math.log10(ratio + 1) * 1.7));
+  }
+
+  // Adaptive near plane: bodies are tiny in real-ratio mode, so a fixed near plane
+  // is easily larger than the camera-to-surface gap — zoom in and the plane slices
+  // through (or past) the body and it vanishes. Keep the near plane at a fraction
+  // of the gap to the focused body's surface so it never clips, while staying as
+  // large as possible for depth precision. Grows back as you zoom out.
+  {
+    const d   = camera.position.distanceTo(controls.target);
+    const r   = focusTarget.mesh.scale.x || 1;
+    const gap = d - r;                                   // camera → near surface
+    const near = gap > 0 ? Math.max(1e-6, gap * 0.5) : 1e-6;
+    if (Math.abs(near - camera.near) > near * 0.05){
+      camera.near = near;
+      camera.updateProjectionMatrix();
+    }
   }
 
   // Galaxy density fade: from inside the solar system the local star density is

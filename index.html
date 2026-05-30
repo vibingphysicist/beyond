@@ -27,6 +27,11 @@
     border-radius:4px; cursor:pointer; margin-right:6px; font-size:12px;
   }
   #controls button:hover { background:#243352; }
+  #controls select {
+    background:#1a2438; color:#cfd6e4; border:1px solid #2a3a5c; padding:3px 8px;
+    border-radius:4px; cursor:pointer; font-size:12px; margin-top:4px;
+  }
+  #controls select:hover { background:#243352; }
   #planets {
     position:fixed; top:10px; right:10px; padding:10px 12px; background:rgba(8,12,22,0.78);
     border:1px solid #1b2436; border-radius:8px; font-size:12px; min-width:260px; max-height:80vh; overflow:auto;
@@ -67,7 +72,18 @@
 
 <div id="controls">
   <div><button id="pause">Pause</button><button id="reset">Reset</button><button id="trails">Orbits: on</button><button id="follow">Follow: off</button></div>
-  <div style="margin-top:6px"><button id="modeBtn">Mode: Real ratios</button><button id="scaleMode">1×</button></div>
+  <div style="margin-top:6px"><button id="modeBtn">Mode: Real ratios</button><button id="scaleMode">1×</button>
+    <select id="missionSel" title="Launch a famous man-made spacecraft">
+      <option value="" disabled selected>🚀 Launch mission…</option>
+      <option value="artemis2">Artemis II — lunar free-return</option>
+      <option value="apollo11">Apollo 11 — Moon landing</option>
+      <option value="iss">ISS — assemble in LEO</option>
+      <option value="hubble">Hubble Space Telescope — LEO</option>
+      <option value="jwst">James Webb — Sun-Earth L2</option>
+      <option value="voyager1">Voyager 1 — interstellar</option>
+      <option value="parker">Parker Solar Probe — close perihelion</option>
+    </select>
+  </div>
   <label>Orbit time scale (days per real second): <span id="tsv">1</span></label>
   <input type="range" id="tsRange" min="-2" max="4" step="0.01" value="0" />
   <label>Rotation time scale (days per real second): <span id="rsv">1</span></label>
@@ -1694,6 +1710,294 @@ function buildCapsule(){
 const ALIEN_BUILDERS = [buildSaucer, buildMothership, buildFighter, buildOrb];
 const HUMAN_BUILDERS = [buildRocket, buildShuttle, buildCapsule];
 
+// ---- Orion (Artemis II) — capsule + service module + 4 solar arrays + engine ----
+function buildOrion(){
+  const white = 0xffffff, dark = 0x202020, gold = 0xf2c46a, g = new THREE.Group();
+  // Crew capsule — self-lit so the craft reads brightly against deep space.
+  const cap = new THREE.Mesh(new THREE.CylinderGeometry(0.10, 0.26, 0.34, 22), matEmit(white, 0xeef2ff, 0.65)); cap.rotation.x = -Math.PI/2; g.add(cap);
+  const hs  = new THREE.Mesh(new THREE.CylinderGeometry(0.26, 0.26, 0.04, 22), matEmit(0x7a3a1a, 0xff7a2a, 0.4)); hs.rotation.x = Math.PI/2; hs.position.z = 0.19; g.add(hs);
+  // Three crew windows on the side, bright cyan
+  for (let k=0; k<3; k++){ const a = (k-1)*0.5;
+    const win = new THREE.Mesh(new THREE.BoxGeometry(0.06,0.04,0.03), matGlow(0xbfe4ff));
+    win.position.set(Math.sin(a)*0.16, Math.cos(a)*0.16, -0.05); g.add(win); }
+  // Service module — emissive grey so it doesn't go dark on the night side
+  const sm = new THREE.Mesh(new THREE.CylinderGeometry(0.22, 0.22, 0.55, 22), matEmit(0xc8ccd2, 0xc8ccd2, 0.45)); sm.rotation.x = Math.PI/2; sm.position.z = 0.49; g.add(sm);
+  const smBand = new THREE.Mesh(new THREE.CylinderGeometry(0.225, 0.225, 0.06, 22), matEmit(gold, gold, 0.8)); smBand.rotation.x = Math.PI/2; smBand.position.z = 0.74; g.add(smBand);
+  // 4 solar array wings — strongly emissive blue so they're visible from a distance
+  for (let k=0;k<4;k++){
+    const a = k * Math.PI/2;
+    const arm = new THREE.Mesh(new THREE.BoxGeometry(0.04,0.04,0.34), matEmit(dark, 0x223366, 0.5));
+    arm.position.set(Math.cos(a)*0.22, Math.sin(a)*0.22, 0.50); g.add(arm);
+    const panel = new THREE.Mesh(new THREE.BoxGeometry(0.78,0.02,0.38), matEmit(0x112266, 0x6688ff, 0.85));
+    panel.position.set(Math.cos(a)*(0.22+0.42), Math.sin(a)*(0.22+0.42), 0.50);
+    panel.lookAt(panel.position.x*2, panel.position.y*2, 0.50);
+    g.add(panel);
+  }
+  // Main engine bell + a constant subtle plume glow at the nozzle
+  const bell = new THREE.Mesh(new THREE.CylinderGeometry(0.10, 0.14, 0.12, 16), matEmit(0x888888, 0xff7a2a, 0.3)); bell.rotation.x = Math.PI/2; bell.position.z = 0.84; g.add(bell);
+  // Soft additive halo so Orion stays a visible spot of light even from far away.
+  const halo = new THREE.Mesh(new THREE.SphereGeometry(1.4, 20, 14), matAdd(0xbfd6ff, 0.18));
+  g.add(halo);
+  return { group:g, beam:null, flame:addFlame(g, 0.88, 1.4, 0xffd28a), orient:'fly', baseSize:0.16, spin:0 };
+}
+
+// Artemis II trajectory — a stylised real-time replay of the 10-day free-return
+// mission compressed into ~90 s: launch → ~2 LEO orbits → TLI → trans-lunar coast
+// → loop the far side of the Moon (the free-return swing) → trans-Earth coast →
+// re-entry / Pacific splashdown. Anchored to current Earth and Moon positions so
+// the flyby always hits the actual Moon wherever it is in the sim.
+const ARTEMIS_TOTAL = 90;
+function artemisPos(sh, t, earthPos, earthR, moonPos, moonR){
+  const m = sh.frame.m, p = sh.frame.p;
+  // (1) Launch & ascent: surface point → LEO insertion. Engines hot.
+  if (t < 3){
+    const u = t/3, e = u*u;
+    const r = earthR * (1.0 + 0.04*e);
+    return { pos: _sv[0].copy(earthPos).addScaledVector(p, r), thrust:true };
+  }
+  // (2) Low-Earth orbit (~2 revolutions over ~20 s for system checks). Coasts.
+  if (t < 23){
+    const theta = (t - 3)/20 * 4*Math.PI;
+    const r = 1.04 * earthR;
+    return { pos: _sv[0].copy(earthPos).addScaledVector(p, r*Math.cos(theta)).addScaledVector(m, r*Math.sin(theta)), thrust:false };
+  }
+  // (3) Trans-lunar coast (TLI burn first 5 s, then coast). Curved path with a
+  //     mid-route bulge so it reads as a long arc, not a chord.
+  if (t < 45){
+    const u = (t - 23)/22;
+    const A = _sv[1].copy(earthPos).addScaledVector(p, 1.04*earthR);
+    const B = _sv[2].copy(moonPos).addScaledVector(m, -2.5*moonR);
+    const pos = _sv[0].copy(A).lerp(B, u).addScaledVector(p, Math.sin(Math.PI*u) * 6*earthR);
+    return { pos, thrust: t < 28 };
+  }
+  // (4) Lunar flyby: ¾-revolution around the Moon (Earth-side → far side → +p
+  //     departure) at ~2.5 lunar radii, the free-return swing. Coasts.
+  if (t < 51){
+    const u = (t - 45)/6;
+    const theta = Math.PI + u * (1.5*Math.PI);                   // π → 5π/2
+    const r = 2.5 * moonR;
+    return { pos: _sv[0].copy(moonPos).addScaledVector(m, r*Math.cos(theta)).addScaledVector(p, r*Math.sin(theta)), thrust:false };
+  }
+  // (5) Trans-Earth coast — mirror of phase 3, with the bulge on the −p side.
+  if (t < 80){
+    const u = (t - 51)/29;
+    const A = _sv[1].copy(moonPos).addScaledVector(p, 2.5*moonR);
+    const B = _sv[2].copy(earthPos).addScaledVector(p, -1.04*earthR);
+    const pos = _sv[0].copy(A).lerp(B, u).addScaledVector(p, Math.sin(Math.PI*u) * 4*earthR);
+    return { pos, thrust:false };
+  }
+  // (6) Entry interface → Pacific splashdown. Brief reentry burn at the start.
+  if (t < ARTEMIS_TOTAL){
+    const u = (t - 80)/(ARTEMIS_TOTAL - 80);
+    const r = earthR * (1.04 - 0.04*u);
+    return { pos: _sv[0].copy(earthPos).addScaledVector(p, -r), thrust: u < 0.35 };
+  }
+  return null;          // mission complete → despawn
+}
+
+// ---- Builders for other famous spacecraft (simple but recognisable) ----
+function buildISS(){
+  const g = new THREE.Group();
+  for (let z = -0.45; z <= 0.45; z += 0.18){
+    const tr = new THREE.Mesh(new THREE.BoxGeometry(1.4, 0.04, 0.04), matEmit(0xb0b4ba, 0x556070, 0.5));
+    tr.position.z = z; g.add(tr);
+  }
+  const mod = new THREE.Mesh(new THREE.CylinderGeometry(0.10, 0.10, 0.6, 18), matEmit(0xeeeef2, 0xccd2e0, 0.55));
+  mod.rotation.x = Math.PI/2; g.add(mod);
+  for (const sgn of [-1, 1]) for (const za of [-0.36, 0.36]){
+    const arm = new THREE.Mesh(new THREE.BoxGeometry(0.04, 0.04, 0.36), matEmit(0x333, 0x223366, 0.4));
+    arm.position.set(sgn*0.5, 0, za); arm.rotation.y = Math.PI/2; g.add(arm);
+    const pn = new THREE.Mesh(new THREE.BoxGeometry(0.5, 0.02, 0.36), matEmit(0x112266, 0x6688ff, 0.85));
+    pn.position.set(sgn*0.74, 0, za); g.add(pn);
+  }
+  g.add(new THREE.Mesh(new THREE.SphereGeometry(1.4, 18, 12), matAdd(0xbfd6ff, 0.14)));
+  return { group:g, beam:null, flame:addFlame(g, 0.6, 0.7, 0xff9a3a), orient:'fly', baseSize:0.16, spin:0 };
+}
+function buildHubble(){
+  const g = new THREE.Group();
+  const body = new THREE.Mesh(new THREE.CylinderGeometry(0.18, 0.18, 1.0, 22), matEmit(0xd6dae2, 0xb0bccc, 0.55));
+  body.rotation.x = Math.PI/2; g.add(body);
+  const aper = new THREE.Mesh(new THREE.CylinderGeometry(0.18, 0.18, 0.02, 22), matEmit(0x111, 0x4488ff, 0.4));
+  aper.rotation.x = Math.PI/2; aper.position.z = -0.5; g.add(aper);
+  for (const sgn of [-1, 1]){
+    const arm = new THREE.Mesh(new THREE.BoxGeometry(0.04, 0.04, 0.28), matEmit(0x333, 0x223366, 0.4));
+    arm.position.set(sgn*0.22, 0, 0); arm.rotation.y = Math.PI/2; g.add(arm);
+    const pn = new THREE.Mesh(new THREE.BoxGeometry(0.6, 0.02, 0.3), matEmit(0x112266, 0x6688ff, 0.9));
+    pn.position.set(sgn*0.6, 0, 0); g.add(pn);
+  }
+  g.add(new THREE.Mesh(new THREE.SphereGeometry(1.2, 18, 12), matAdd(0xbfd6ff, 0.15)));
+  return { group:g, beam:null, flame:addFlame(g, 0.55, 0.6, 0xff9a3a), orient:'fly', baseSize:0.11, spin:0 };
+}
+function buildJWST(){
+  const g = new THREE.Group();
+  for (let k = 0; k < 5; k++){
+    const sh = new THREE.Mesh(new THREE.BoxGeometry(1.2 + k*0.08, 0.01, 0.8 + k*0.06), matEmit(0xb5946a, 0xf2c46a, 0.7));
+    sh.position.set(0, -0.06 - k*0.04, 0.0); g.add(sh);
+  }
+  for (let k = 0; k < 7; k++){
+    const a = k === 0 ? 0 : ((k-1)/6) * Math.PI*2;
+    const r = k === 0 ? 0 : 0.18;
+    const hex = new THREE.Mesh(new THREE.CylinderGeometry(0.10, 0.10, 0.02, 6), matEmit(0xfff1c0, 0xffe080, 0.95));
+    hex.position.set(Math.cos(a)*r, 0.15, Math.sin(a)*r); g.add(hex);
+  }
+  g.add(new THREE.Mesh(new THREE.SphereGeometry(1.2, 18, 12), matAdd(0xffe5a0, 0.20)));
+  return { group:g, beam:null, flame:addFlame(g, 0.4, 0.5, 0xff9a3a), orient:'fly', baseSize:0.10, spin:0 };
+}
+function buildVoyager(){
+  const g = new THREE.Group();
+  const dish = new THREE.Mesh(new THREE.CylinderGeometry(0.50, 0.50, 0.04, 28), matEmit(0xe2e2e6, 0xc8d2e0, 0.7));
+  dish.rotation.x = Math.PI/2; dish.position.z = -0.3; g.add(dish);
+  const rim = new THREE.Mesh(new THREE.TorusGeometry(0.50, 0.02, 8, 36), matEmit(0xaaaaaa, 0x666, 0.4));
+  rim.rotation.x = Math.PI/2; rim.position.z = -0.3; g.add(rim);
+  const bus = new THREE.Mesh(new THREE.BoxGeometry(0.28, 0.22, 0.28), matEmit(0xa0a4ac, 0x666, 0.5)); g.add(bus);
+  const boom = new THREE.Mesh(new THREE.CylinderGeometry(0.02, 0.02, 0.7, 8), matEmit(0x333, 0x222, 0.4));
+  boom.rotation.z = Math.PI/2; boom.position.x = 0.5; g.add(boom);
+  const rtg = new THREE.Mesh(new THREE.CylinderGeometry(0.05, 0.05, 0.18, 12), matEmit(0x4a2818, 0xff6622, 0.85));
+  rtg.rotation.z = Math.PI/2; rtg.position.x = 0.85; g.add(rtg);
+  g.add(new THREE.Mesh(new THREE.SphereGeometry(1.2, 18, 12), matAdd(0xffd9b0, 0.18)));
+  return { group:g, beam:null, flame:null, orient:'fly', baseSize:0.10, spin:0 };
+}
+function buildParker(){
+  const g = new THREE.Group();
+  const shield = new THREE.Mesh(new THREE.CylinderGeometry(0.45, 0.45, 0.04, 6), matEmit(0xeeeeee, 0xffffff, 1.0));
+  shield.rotation.x = Math.PI/2; shield.position.z = -0.32; g.add(shield);
+  const bus = new THREE.Mesh(new THREE.BoxGeometry(0.24, 0.24, 0.4), matEmit(0xa8acb4, 0x666, 0.55)); g.add(bus);
+  for (const sgn of [-1, 1]){
+    const pn = new THREE.Mesh(new THREE.BoxGeometry(0.04, 0.02, 0.3), matEmit(0x112266, 0x6688ff, 0.75));
+    pn.position.set(sgn*0.22, 0, 0.1); g.add(pn);
+  }
+  g.add(new THREE.Mesh(new THREE.SphereGeometry(1.2, 18, 12), matAdd(0xffd28a, 0.28)));
+  return { group:g, beam:null, flame:null, orient:'fly', baseSize:0.09, spin:0 };
+}
+
+// ---- Trajectories for each mission. Anchored to current Earth / Moon / Sun. ----
+function trajApollo11(sh, t, earthPos, earthR, moonPos, moonR){
+  const m = sh.frame.m, p = sh.frame.p;
+  if (t < 3){ const u=t/3, e=u*u; const r=earthR*(1+0.04*e); return { pos:_sv[0].copy(earthPos).addScaledVector(p,r), thrust:true }; }
+  if (t < 18){ const th=(t-3)/15 * 3*Math.PI; const r=1.04*earthR;
+    return { pos:_sv[0].copy(earthPos).addScaledVector(p,r*Math.cos(th)).addScaledVector(m,r*Math.sin(th)), thrust:false }; }
+  if (t < 40){ const u=(t-18)/22; const A=_sv[1].copy(earthPos).addScaledVector(p,1.04*earthR);
+    const B=_sv[2].copy(moonPos).addScaledVector(m,-1.4*moonR);
+    return { pos:_sv[0].copy(A).lerp(B,u).addScaledVector(p, Math.sin(Math.PI*u)*5*earthR), thrust:t<23 }; }
+  if (t < 60){ const th=Math.PI + (t-40)/20 * 4*Math.PI; const r=1.4*moonR;
+    return { pos:_sv[0].copy(moonPos).addScaledVector(m,r*Math.cos(th)).addScaledVector(p,r*Math.sin(th)), thrust:false }; }
+  if (t < 68){ const u=(t-60)/8;
+    const A=_sv[1].copy(moonPos).addScaledVector(p, 1.4*moonR);
+    const B=_sv[2].copy(moonPos).addScaledVector(p, moonR + 0.03*earthR);
+    return { pos:_sv[0].copy(A).lerp(B,u), thrust:u>0.6 }; }
+  if (t < 80) return { pos:_sv[0].copy(moonPos).addScaledVector(p, moonR + 0.03*earthR), thrust:false };
+  if (t < 86){ const u=(t-80)/6;
+    const A=_sv[1].copy(moonPos).addScaledVector(p, moonR + 0.03*earthR);
+    const B=_sv[2].copy(moonPos).addScaledVector(p, 1.4*moonR);
+    return { pos:_sv[0].copy(A).lerp(B,u), thrust:true }; }
+  if (t < 115){ const u=(t-86)/29;
+    const A=_sv[1].copy(moonPos).addScaledVector(p, 1.4*moonR);
+    const B=_sv[2].copy(earthPos).addScaledVector(p, -1.04*earthR);
+    return { pos:_sv[0].copy(A).lerp(B,u).addScaledVector(p, Math.sin(Math.PI*u)*4*earthR), thrust:false }; }
+  if (t < 125){ const u=(t-115)/10; const r=earthR*(1.04 - 0.04*u);
+    return { pos:_sv[0].copy(earthPos).addScaledVector(p,-r), thrust:u<0.35 }; }
+  return null;
+}
+function trajLEO(sh, t, earthPos, earthR, _moonPos, _moonR){
+  const m = sh.frame.m, p = sh.frame.p;
+  const orbitAlt = sh.orbitAlt || 1.05;
+  if (t < 3){ const u=t/3, e=u*u; const r=earthR*(1+(orbitAlt-1)*e);
+    return { pos:_sv[0].copy(earthPos).addScaledVector(p,r), thrust:true }; }
+  const orbitDur = sh.orbitDur || 240;
+  if (t < 3 + orbitDur){ const th=(t-3) * 0.5; const r=orbitAlt*earthR;
+    return { pos:_sv[0].copy(earthPos).addScaledVector(p,r*Math.cos(th)).addScaledVector(m,r*Math.sin(th)), thrust:false }; }
+  const tEnd = 3 + orbitDur + 6;
+  if (t < tEnd){ const u=(t - (3+orbitDur))/6; const r=earthR*(orbitAlt - (orbitAlt-1)*u);
+    const th = (3+orbitDur) * 0.5;
+    return { pos:_sv[0].copy(earthPos).addScaledVector(p,r*Math.cos(th)).addScaledVector(m,r*Math.sin(th)), thrust:u<0.3 }; }
+  return null;
+}
+function trajJWST(sh, t, earthPos, earthR){
+  const m = sh.frame.m, p = sh.frame.p;     // m points to the Sun
+  if (t < 3){ const u=t/3,e=u*u; const r=earthR*(1+0.04*e); return { pos:_sv[0].copy(earthPos).addScaledVector(p,r), thrust:true }; }
+  if (t < 50){ const u=(t-3)/47; const dist = 1.04*earthR + u*u*(18*earthR);   // accelerate outward, anti-Sun
+    return { pos:_sv[0].copy(earthPos).addScaledVector(m, -dist), thrust:t<10 }; }
+  if (t < 200){ const u=(t-50)*0.4; const r = 1.2*earthR;
+    return { pos:_sv[0].copy(earthPos).addScaledVector(m, -20*earthR).addScaledVector(p, r*Math.cos(u)).addScaledVector(m, r*Math.sin(u)*0.3),
+             thrust:false }; }
+  return null;
+}
+function trajVoyager(sh, t, earthPos, earthR){
+  const m = sh.frame.m, p = sh.frame.p;
+  if (t < 3){ const u=t/3,e=u*u; const r=earthR*(1+0.04*e); return { pos:_sv[0].copy(earthPos).addScaledVector(p,r), thrust:true }; }
+  if (t < 12){ const th=(t-3)/9 * 2*Math.PI; const r=1.04*earthR;
+    return { pos:_sv[0].copy(earthPos).addScaledVector(p,r*Math.cos(th)).addScaledVector(m,r*Math.sin(th)), thrust:false }; }
+  if (t < 200){ const u=(t-12)/188;
+    const dist = 1.04*earthR + u*(400*earthR);     // races outward through the system
+    return { pos:_sv[0].copy(earthPos).addScaledVector(m, dist).addScaledVector(p, dist*0.18), thrust:t<18 }; }
+  return null;
+}
+function trajParker(sh, t, earthPos, earthR){
+  const m = sh.frame.m, p = sh.frame.p;        // m points away from Sun (Earth - Sun)
+  const sunPos = meshes[0].position;
+  if (t < 3){ const u=t/3,e=u*u; const r=earthR*(1+0.04*e); return { pos:_sv[0].copy(earthPos).addScaledVector(p,r), thrust:true }; }
+  // Cruise inward to a tight loop around the Sun, then back outward.
+  if (t < 50){ const u=(t-3)/47; const ease=u*u*(3-2*u);
+    const A=_sv[1].copy(earthPos);
+    const B=_sv[2].copy(sunPos).addScaledVector(m, 0.10);     // 0.10 AU perihelion approx
+    return { pos:_sv[0].copy(A).lerp(B, ease).addScaledVector(p, Math.sin(Math.PI*u)*0.25), thrust:t<8 }; }
+  if (t < 70){ const th=Math.PI + (t-50)/20 * 2*Math.PI; const r=0.10;
+    return { pos:_sv[0].copy(sunPos).addScaledVector(m, r*Math.cos(th)).addScaledVector(p, r*Math.sin(th)), thrust:false }; }
+  if (t < 110){ const u=(t-70)/40; const ease=u*u;
+    const A=_sv[1].copy(sunPos).addScaledVector(m, 0.10);
+    const B=_sv[2].copy(earthPos).addScaledVector(m, 0.6);
+    return { pos:_sv[0].copy(A).lerp(B, ease).addScaledVector(p, Math.sin(Math.PI*u)*0.25), thrust:false }; }
+  return null;
+}
+
+// ---- Mission registry + dispatcher ----
+const MISSIONS = {
+  artemis2: { build: buildOrion,   traj: artemisPos,    frame:'earth-moon', extras:null },
+  apollo11: { build: buildRocket,  traj: trajApollo11,  frame:'earth-moon', extras:{baseSize:0.10} },
+  iss:      { build: buildISS,     traj: trajLEO,       frame:'earth-tilt', extras:{orbitAlt:1.05, orbitDur:300} },
+  hubble:   { build: buildHubble,  traj: trajLEO,       frame:'earth-tilt', extras:{orbitAlt:1.085, orbitDur:300} },
+  jwst:     { build: buildJWST,    traj: trajJWST,      frame:'earth-sun',  extras:null },
+  voyager1: { build: buildVoyager, traj: trajVoyager,   frame:'earth-out',  extras:null },
+  parker:   { build: buildParker,  traj: trajParker,    frame:'earth-sun',  extras:null },
+};
+function spawnMission(key){
+  const mission = MISSIONS[key]; if (!mission) return;
+  const eM = meshes[earthState.index]; if (!eM) return;
+  const earthPos = eM.position;
+  const moonPos = earthMoon ? earthMoon.mesh.position : earthPos;
+  const sunPos = meshes[0].position;
+  let m, p;
+  if (mission.frame === 'earth-moon'){
+    if (!earthMoon) return;
+    const v = _sv[0].subVectors(moonPos, earthPos); if (v.lengthSq()<1e-12) return;
+    m = v.normalize().clone(); p = new THREE.Vector3().crossVectors(m, _YUP);
+    if (p.lengthSq()<1e-6) p.crossVectors(m, new THREE.Vector3(1,0,0)); p.normalize();
+  } else if (mission.frame === 'earth-sun'){
+    const v = _sv[0].subVectors(earthPos, sunPos); if (v.lengthSq()<1e-12) return;
+    m = v.normalize().clone();          // Earth - Sun (anti-Sun direction from Earth)
+    p = new THREE.Vector3().crossVectors(m, _YUP);
+    if (p.lengthSq()<1e-6) p.crossVectors(m, new THREE.Vector3(1,0,0)); p.normalize();
+  } else if (mission.frame === 'earth-tilt'){
+    const n = cUnit(); const t = Math.abs(n.y)>0.9 ? new THREE.Vector3(1,0,0) : _YUP;
+    p = new THREE.Vector3().crossVectors(n, t).normalize();
+    m = new THREE.Vector3().crossVectors(n, p).normalize();
+  } else {                              // 'earth-out' — outward into deep space
+    m = cUnit().clone();
+    p = new THREE.Vector3().crossVectors(m, _YUP);
+    if (p.lengthSq()<1e-6) p.crossVectors(m, new THREE.Vector3(1,0,0)); p.normalize();
+  }
+  const spec = mission.build();
+  spec.group.frustumCulled = false; scene.add(spec.group);
+  const sh = {
+    group:spec.group, beam:null, flame:spec.flame||null, orient:'fly',
+    baseSize: (mission.extras && mission.extras.baseSize) || spec.baseSize,
+    spinRate:0, spinPhase:0, faction:'human',
+    frame:{ m, p }, state:'mission', trajFn: mission.traj, t:0, prevPos:null,
+  };
+  if (mission.extras) for (const k of Object.keys(mission.extras)) sh[k] = mission.extras[k];
+  craft.push(sh);
+}
+
 function spawnCraft(){
   const human = Math.random() < 0.3;
   const spec = cPick(human ? HUMAN_BUILDERS : ALIEN_BUILDERS)();
@@ -1741,6 +2045,16 @@ function updateCraft(dt, earthPos, earthR, moonPos, moonR){
   for (let i = craft.length-1; i >= 0; i--){
     const sh = craft[i]; sh.t += dt;
     sh.group.scale.setScalar(sh.baseSize * earthR);
+
+    if (sh.state === 'mission'){
+      const out = sh.trajFn(sh, sh.t, earthPos, earthR, moonPos, moonR);
+      if (!out){ disposeCraft(sh, i); continue; }
+      const refDir = _sv[4].copy(out.pos).sub(earthPos);
+      placeCraft(sh, out.pos, refDir, dt, 'fly');
+      craftFx(sh, !!out.thrust, false);
+      continue;
+    }
+
     const orbitRad = sh.orbitR * earthR;
     const orbitPos = ang => _sv[0].copy(earthPos).addScaledVector(sh.u, orbitRad*Math.cos(ang)).addScaledVector(sh.v, orbitRad*Math.sin(ang));
 
@@ -1832,6 +2146,12 @@ trafficRange.addEventListener('input', () => {
   elTrafficV.textContent = TRAFFIC_LABELS[trafficIdx];
 });
 elTrafficV.textContent = TRAFFIC_LABELS[trafficIdx];
+const missionSel = document.getElementById('missionSel');
+missionSel.addEventListener('change', () => {
+  const v = missionSel.value;
+  if (v) spawnMission(v);
+  missionSel.value = '';                 // reset so the same option can be picked again
+});
 
 // ============================================================================
 // Main loop
